@@ -33,9 +33,11 @@ def _wrap_to_pi(delta: Tensor) -> Tensor:
     return torch.atan2(torch.sin(delta), torch.cos(delta))
 
 
-def _normalize_cos_sin(cos_v: Tensor,
-                       sin_v: Tensor,
-                       eps: float = 1e-8) -> Tuple[Tensor, Tensor]:
+def _normalize_cos_sin(
+    cos_v: Tensor,
+    sin_v: Tensor,
+    eps: float = 1e-8,
+) -> Tuple[Tensor, Tensor]:
     """(cos, sin)을 길이 1로 정규화합니다.
 
     Args:
@@ -48,10 +50,9 @@ def _normalize_cos_sin(cos_v: Tensor,
             - cos_n: shape (...)
             - sin_n: shape (...)
     """
-    r = torch.sqrt(cos_v * cos_v + sin_v * sin_v + float(eps))
-    cos_n = cos_v / r
-    sin_n = sin_v / r
-    return cos_n, sin_n
+    # sqrt + division 대신 rsqrt + multiply로 바꿔서 더 가볍게 처리
+    inv_r = torch.rsqrt(cos_v * cos_v + sin_v * sin_v + float(eps))
+    return cos_v * inv_r, sin_v * inv_r
 
 
 def _rot_vec_by_yaw(vx: Tensor, vy: Tensor, cos_y: Tensor,
@@ -129,13 +130,36 @@ def _compute_acc_from_vxvy(vxvy: Tensor, valid: Tensor, dt: float) -> Tensor:
         return acc
 
     dv = vxvy[..., 1:, :] - vxvy[..., :-1, :]  # (..., T-1, 2)
-    seg_valid = valid[..., 1:] & valid[..., :-1]  # (..., T-1)
+    dv.mul_(1.0 / float(dt))
 
-    dv = dv / float(dt)
-    acc[..., 1:, :] = torch.where(seg_valid.unsqueeze(-1), dv,
-                                  torch.zeros_like(dv))
+    # 일단 전체를 채우고, invalid 구간만 0으로 덮어씀 (결과는 동일)
+    acc[..., 1:, :].copy_(dv)
+
+    seg_valid = valid[..., 1:] & valid[..., :-1]  # (..., T-1)
+    acc[..., 1:, :].masked_fill_(~seg_valid.unsqueeze(-1), 0.0)
     return acc
 
+_UPPER_TRI_MASK_CACHE: Dict[Tuple[torch.device, int], Tensor] = {}
+
+def _get_upper_tri_mask(device: torch.device, A: int) -> Tensor:
+    """(A,A)에서 i<j만 True인 마스크를 캐시로 가져옵니다.
+
+    Args:
+        device (torch.device): 마스크가 올라갈 디바이스.
+        A (int): agent 수.
+
+    Returns:
+        Tensor: shape (A, A) bool. i<j 위치만 True.
+    """
+    key = (device, int(A))
+    m = _UPPER_TRI_MASK_CACHE.get(key, None)
+    if m is None:
+        m = torch.triu(
+            torch.ones((int(A), int(A)), device=device, dtype=torch.bool),
+            diagonal=1,
+        )
+        _UPPER_TRI_MASK_CACHE[key] = m
+    return m
 
 def _obb_intersects_others_vs_others(
     oth_xy: Tensor,  # (B, A, 2)
@@ -234,10 +258,7 @@ def _obb_intersects_others_vs_others(
 
     # valid pair mask (i<j only)
     valid_ij = oth_valid[:, :, None] & oth_valid[:, None, :]  # (B,A,A)
-    upper = torch.triu(
-        torch.ones((A, A), device=oth_xy.device, dtype=torch.bool),
-        diagonal=1,
-    )  # (A,A)
+    upper = _get_upper_tri_mask(oth_xy.device, A)  # (A,A)
     valid_ij = valid_ij & upper  # broadcast to (B,A,A)
 
     if pair_mask is not None:
@@ -2241,12 +2262,16 @@ class NPCStatePerturbation:
         aug_nbr = (aug_sample_mask[:, None] & nbr_pick & nbr_cur_valid &
                    nbr_speed_ok & nbr_has_past & nbr_has_fut)  # (B,A)
 
-        any_agent_aug = aug_ego | (torch.any(aug_nbr, dim=1)
-                                   if A > 0 else torch.zeros(
-                                       (B,), device=device, dtype=torch.bool))
+        any_agent_aug = aug_ego | (
+            torch.any(aug_nbr, dim=1) if A > 0 else torch.zeros((B,),
+                                                                device=device,
+                                                                dtype=torch.bool)
+        )
         do_sample_aug = aug_sample_mask & any_agent_aug  # (B,)
 
-        if not bool(torch.any(do_sample_aug)):
+        # ✅ CPU가 torch.any(...) 결과를 매번 확인하지 않게, nonzero 결과를 1번만 만듦
+        sel_do = torch.nonzero(do_sample_aug, as_tuple=True)[0]  # (Bs,)
+        if int(sel_do.numel()) == 0:
             return
         # -----------------------------
         # [DEBUG] 증강 전(before) 스냅샷(최소 비용)
@@ -2261,13 +2286,12 @@ class NPCStatePerturbation:
             debug_every_n_steps=int(debug_every_n_steps),
         )
         if debug_enabled:
-            cand = torch.nonzero(do_sample_aug, as_tuple=True)[0]  # (K,)
             # collision reject를 감안해 조금 여유 있게 저장 후보를 잡음
             max_cache = max(1, int(debug_max_scenes) * 8)
             debug_before_cache = self._build_debug_before_cache(
                 inputs=inputs,
                 outputs=outputs,
-                candidate_indices=cand,
+                candidate_indices=sel_do,
                 max_cache=int(max_cache),
             )
         # -----------------------------
@@ -2586,7 +2610,7 @@ class NPCStatePerturbation:
         #   (2) others vs others (neighbor끼리)
         #       - 속도/데이터 손실을 줄이기 위해 "증강된 neighbor가 포함된 pair"만 검사
         # -----------------------------
-        sel = torch.nonzero(do_sample_aug, as_tuple=True)[0]
+        sel = sel_do  # ✅ 위에서 만든 걸 재사용
         if int(sel.numel()) == 0:
             return
 
@@ -2632,14 +2656,14 @@ class NPCStatePerturbation:
             # --- neighbor-neighbor collision (증강된 neighbor가 포함된 pair만) ---
             collide_nbr_sel = torch.zeros_like(collide_sel)  # (Bs,)
             if A > 1:
-                aug_nbr_sel_mask = aug_nbr[sel]  # (Bs,A)
                 any_aug_nbr_sel = torch.any(aug_nbr_sel_mask, dim=1)  # (Bs,)
-                if bool(torch.any(any_aug_nbr_sel)):
-                    idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[0]  # (Bs2,)
-
+                idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[
+                    0]  # (Bs2,)
+                if int(idx_sub.numel()) != 0:
                     # (i,j) 중 하나라도 증강된 neighbor이면 True
                     pair_mask_sub = (aug_nbr_sel_mask[idx_sub, :, None] |
-                                     aug_nbr_sel_mask[idx_sub, None, :])  # (Bs2,A,A)
+                                     aug_nbr_sel_mask[
+                                         idx_sub, None, :])  # (Bs2,A,A)
 
                     collide_sub = _obb_intersects_others_vs_others(
                         oth_xy=oth_xy_sel[idx_sub],
@@ -2656,25 +2680,18 @@ class NPCStatePerturbation:
             collide_nbr_sel = torch.zeros_like(collide_sel)
 
         final_aug_sample_mask = do_sample_aug.clone()
-        final_aug_sample_mask[sel] = final_aug_sample_mask[sel] & (~(collide_sel | collide_nbr_sel))
+        final_aug_sample_mask[sel] = final_aug_sample_mask[sel] & (
+            ~(collide_sel | collide_nbr_sel))
 
-        if not bool(torch.any(final_aug_sample_mask)):
-            return
-
-
-        if not bool(torch.any(final_aug_sample_mask)):
+        # ✅ torch.any(...)로 CPU가 확인하지 말고, 필요한 idx_keep를 바로 만듦
+        idx_keep = torch.nonzero(final_aug_sample_mask, as_tuple=True)[
+            0]  # (Bk,)
+        if int(idx_keep.numel()) == 0:
             return
 
         # 샘플 단위로 꺼진 것들은 agent도 전부 꺼짐
         aug_ego = aug_ego & final_aug_sample_mask
         aug_nbr = aug_nbr & final_aug_sample_mask[:, None]
-
-        # -----------------------------
-        # Step 9) perturbed current를 ego_agent_past / neighbor_agents_past에 반영
-        # -----------------------------
-        idx_keep = torch.nonzero(final_aug_sample_mask, as_tuple=True)[0]
-        if int(idx_keep.numel()) == 0:
-            return
 
         # ego current 업데이트
         if bool(torch.any(aug_ego[idx_keep])):
@@ -2990,38 +3007,45 @@ class NPCStatePerturbation:
                                          device=device,
                                          dtype=torch.bool)
 
-        # ---- past 보간 helper (ego 또는 neighbor 공용) ----
-        def _apply_past_interp_for_mask(
+
+        # ---- past/future 보간 helper (선택 인덱스 재사용 버전) ----
+        def _apply_past_interp_for_sel(
             traj_past: Tensor,      # (Bk, ..., Tp, 11)
             acc_past: Tensor,       # (Bk, ..., Tp, 2)
             cur_acc_new: Tensor,    # (Bk, ..., 2)
-            mask: Tensor,           # (Bk, ...) bool
+            sel_i: Tensor,          # (M,) long, flatten된 lead-dim 인덱스
             Np: int,
             Tsec: float,
         ) -> None:
+            """과거 구간[t_cur-Np : t_cur]을 quintic으로 다시 만듭니다.
+
+            Args:
+                traj_past (Tensor): shape (Bk, ..., Tp, 11)
+                acc_past (Tensor): shape (Bk, ..., Tp, 2)
+                cur_acc_new (Tensor): shape (Bk, ..., 2)
+                sel_i (Tensor): shape (M,) long. flatten된 (Bk*...) 기준 인덱스.
+                Np (int): past step 수
+                Tsec (float): Np*dt (초)
+            """
             if int(Np) <= 0:
                 return
             if t_cur - int(Np) < 0:
                 return
+            if int(sel_i.numel()) == 0:
+                return
 
-            lead = traj_past.shape[:-2]  # (Bk, ...)
             Tloc = int(traj_past.shape[-2])
-            flat_n = int(torch.prod(torch.tensor(lead, device=device)).item())
+            flat_n = int(traj_past.numel() // (Tloc * 11))
 
             traj_f = traj_past.reshape(flat_n, Tloc, 11)
             acc_f = acc_past.reshape(flat_n, Tloc, 2)
             curacc_f = cur_acc_new.reshape(flat_n, 2)
 
-            m_f = mask.reshape(flat_n)
-            sel_i = torch.nonzero(m_f, as_tuple=True)[0]
-            if int(sel_i.numel()) == 0:
-                return
-
             tA = t_cur - int(Np)
 
-            s_tr = traj_f[sel_i]   # (M, Tp, 11)
-            s_ac = acc_f[sel_i]    # (M, Tp, 2)
-            s_ca = curacc_f[sel_i] # (M, 2)
+            s_tr = traj_f.index_select(0, sel_i)    # (M, Tp, 11)
+            s_ac = acc_f.index_select(0, sel_i)     # (M, Tp, 2)
+            s_ca = curacc_f.index_select(0, sel_i)  # (M, 2)
 
             xA = s_tr[:, tA, self.IDX_X]
             yA = s_tr[:, tA, self.IDX_Y]
@@ -3040,23 +3064,21 @@ class NPCStatePerturbation:
             x_seq, vx_seq = self._quintic_1d(
                 x0=xA, v0=vxA, a0=axA,
                 x1=x0, v1=vx0, a1=ax0,
-                T=float(Tsec), N=int(Np)
+                T=float(Tsec), N=int(Np),
             )
             y_seq, vy_seq = self._quintic_1d(
                 x0=yA, v0=vyA, a0=ayA,
                 x1=y0, v1=vy0, a1=ay0,
-                T=float(Tsec), N=int(Np)
+                T=float(Tsec), N=int(Np),
             )
 
-            # write back segment [tA:t_cur]
             s_tr[:, tA:(t_cur + 1), self.IDX_X] = x_seq
             s_tr[:, tA:(t_cur + 1), self.IDX_Y] = y_seq
             s_tr[:, tA:(t_cur + 1), self.IDX_VX] = vx_seq
             s_tr[:, tA:(t_cur + 1), self.IDX_VY] = vy_seq
 
-            # ✅ 보간으로 바뀐 "중간 프레임"의 heading을 속도 방향으로 맞춤 (끝점은 유지)
+            # 보간으로 바뀐 중간 프레임 heading만 속도 방향으로 맞춤 (끝점은 유지)
             if int(Np) >= 2:
-                # interior: tA+1 ... t_cur-1  -> 길이 Np-1
                 cos_old = s_tr[:, (tA + 1):t_cur, self.IDX_COS]  # (M, Np-1)
                 sin_old = s_tr[:, (tA + 1):t_cur, self.IDX_SIN]  # (M, Np-1)
                 vx_mid = vx_seq[:, 1:-1]  # (M, Np-1)
@@ -3072,43 +3094,49 @@ class NPCStatePerturbation:
                 s_tr[:, (tA + 1):t_cur, self.IDX_COS] = cos_new
                 s_tr[:, (tA + 1):t_cur, self.IDX_SIN] = sin_new
 
-            traj_f[sel_i] = s_tr
+            traj_f.index_copy_(0, sel_i, s_tr)
 
-        # ---- future 보간 helper ----
-        def _apply_future_interp_for_mask(
+        def _apply_future_interp_for_sel(
             traj_future: Tensor,    # (Bk, ..., Tf, 11)
             acc_future: Tensor,     # (Bk, ..., Tf, 2)
-            cur_past: Tensor,       # (Bk, ..., 11)  현재(t=0)
-            cur_acc_new: Tensor,    # (Bk, ..., 2)   현재(t=0)
-            mask: Tensor,           # (Bk, ...) bool
+            cur_past: Tensor,       # (Bk, ..., 11)
+            cur_acc_new: Tensor,    # (Bk, ..., 2)
+            sel_i: Tensor,          # (M,) long
             Nf: int,
             Tsec: float,
         ) -> None:
+            """미래 구간[0 : Nf-1]을 quintic으로 다시 만듭니다.
+
+            Args:
+                traj_future (Tensor): shape (Bk, ..., Tf, 11)
+                acc_future (Tensor): shape (Bk, ..., Tf, 2)
+                cur_past (Tensor): shape (Bk, ..., 11)
+                cur_acc_new (Tensor): shape (Bk, ..., 2)
+                sel_i (Tensor): shape (M,) long. flatten된 (Bk*...) 기준 인덱스.
+                Nf (int): future step 수
+                Tsec (float): Nf*dt (초)
+            """
             if int(Nf) <= 0:
                 return
             if int(Nf) > int(traj_future.shape[-2]):
                 return
+            if int(sel_i.numel()) == 0:
+                return
 
-            lead = traj_future.shape[:-2]
             Tloc = int(traj_future.shape[-2])
-            flat_n = int(torch.prod(torch.tensor(lead, device=device)).item())
+            flat_n = int(traj_future.numel() // (Tloc * 11))
 
             fut_f = traj_future.reshape(flat_n, Tloc, 11)
             acc_f = acc_future.reshape(flat_n, Tloc, 2)
             cur_f = cur_past.reshape(flat_n, 11)
             curacc_f = cur_acc_new.reshape(flat_n, 2)
 
-            m_f = mask.reshape(flat_n)
-            sel_i = torch.nonzero(m_f, as_tuple=True)[0]
-            if int(sel_i.numel()) == 0:
-                return
+            kT = int(Nf) - 1
 
-            kT = int(Nf) - 1  # future index
-
-            s_fut = fut_f[sel_i]     # (M, Tf, 11)
-            s_acc = acc_f[sel_i]     # (M, Tf, 2)
-            s_cur = cur_f[sel_i]     # (M, 11)
-            s_ca = curacc_f[sel_i]   # (M, 2)
+            s_fut = fut_f.index_select(0, sel_i)     # (M, Tf, 11)
+            s_acc = acc_f.index_select(0, sel_i)     # (M, Tf, 2)
+            s_cur = cur_f.index_select(0, sel_i)     # (M, 11)
+            s_ca = curacc_f.index_select(0, sel_i)   # (M, 2)
 
             x0 = s_cur[:, self.IDX_X]
             y0 = s_cur[:, self.IDX_Y]
@@ -3127,12 +3155,12 @@ class NPCStatePerturbation:
             x_seq, vx_seq = self._quintic_1d(
                 x0=x0, v0=vx0, a0=ax0,
                 x1=xT, v1=vxT, a1=axT,
-                T=float(Tsec), N=int(Nf)
+                T=float(Tsec), N=int(Nf),
             )
             y_seq, vy_seq = self._quintic_1d(
                 x0=y0, v0=vy0, a0=ay0,
                 x1=yT, v1=vyT, a1=ayT,
-                T=float(Tsec), N=int(Nf)
+                T=float(Tsec), N=int(Nf),
             )
 
             # future에는 현재(t=0)가 없으므로, 1..Nf를 0..Nf-1에 저장
@@ -3141,8 +3169,7 @@ class NPCStatePerturbation:
             s_fut[:, :int(Nf), self.IDX_VX] = vx_seq[:, 1:]
             s_fut[:, :int(Nf), self.IDX_VY] = vy_seq[:, 1:]
 
-            # ✅ 보간으로 바뀐 "중간 프레임"의 heading을 속도 방향으로 맞춤
-            #    - 마지막 프레임(kT)은 원래 값 유지 (뒤쪽 구간과의 연결 보호)
+            # 보간으로 바뀐 중간 프레임 heading만 속도 방향으로 맞춤 (마지막 프레임은 유지)
             if int(Nf) >= 2:
                 cos_old = s_fut[:, :(int(Nf) - 1), self.IDX_COS]  # (M, Nf-1)
                 sin_old = s_fut[:, :(int(Nf) - 1), self.IDX_SIN]  # (M, Nf-1)
@@ -3159,15 +3186,9 @@ class NPCStatePerturbation:
                 s_fut[:, :(int(Nf) - 1), self.IDX_COS] = cos_new
                 s_fut[:, :(int(Nf) - 1), self.IDX_SIN] = sin_new
 
-            fut_f[sel_i] = s_fut
+            fut_f.index_copy_(0, sel_i, s_fut)
 
-        # ego past/future
-        # -----------------------------
-        # Step 11/12) past/future quintic 보간 (증강된 agent만)
-        # -----------------------------
-
-        # ✅ 핵심: idx_keep로 뽑은 텐서는 원본과 메모리를 공유하지 않을 수 있으므로
-        #         "작업용 텐서"에서 보간을 수행한 뒤, 마지막에 원본에 다시 써줍니다.
+        # ✅ 작업용 텐서에서 보간 후, 마지막에 원본에 반영
         ego_past_work = ego_agent_past[idx_keep].clone()   # (Bk, Tp, 11)
         ego_fut_work = ego_future_11[idx_keep].clone()     # (Bk, Tf, 11)
 
@@ -3175,140 +3196,134 @@ class NPCStatePerturbation:
             nbr_past_work = nbr_past[idx_keep].clone()     # (Bk, A, Tp, 11)
             nbr_fut_work = nbr_future_11[idx_keep].clone() # (Bk, A, Tf, 11)
 
-        # 타입별 마스크(선택 샘플 내부 Bk 기준)
-        ego_aug_car = aug_ego_sel & ego_is_car_sel
-        ego_aug_cyc = aug_ego_sel & ego_is_cyc_sel
-        ego_aug_ped = aug_ego_sel & ego_is_ped_sel
+        # ---- (1) ego: 증강된 ego 인덱스를 1번만 뽑고, 타입으로 나눠서 재사용 ----
+        sel_ego_all = torch.nonzero(aug_ego_sel, as_tuple=True)[0]  # (Me,)
+        sel_ego_car = sel_ego_all[ego_is_car_sel[sel_ego_all]]
+        sel_ego_cyc = sel_ego_all[ego_is_cyc_sel[sel_ego_all]]
+        sel_ego_ped = sel_ego_all[ego_is_ped_sel[sel_ego_all]]
 
-        # ---- past (ego) ----
-        if bool(torch.any(ego_aug_car)):
-            _apply_past_interp_for_mask(
-                traj_past=ego_past_work,
-                acc_past=ego_acc_past_sel,
-                cur_acc_new=ego_cur_acc_new,
-                mask=ego_aug_car,
+        _apply_past_interp_for_sel(
+            traj_past=ego_past_work,
+            acc_past=ego_acc_past_sel,
+            cur_acc_new=ego_cur_acc_new,
+            sel_i=sel_ego_car,
+            Np=Np_car,
+            Tsec=float(Np_car) * self._dt,
+        )
+        _apply_past_interp_for_sel(
+            traj_past=ego_past_work,
+            acc_past=ego_acc_past_sel,
+            cur_acc_new=ego_cur_acc_new,
+            sel_i=sel_ego_cyc,
+            Np=Np_cyc,
+            Tsec=float(Np_cyc) * self._dt,
+        )
+        _apply_past_interp_for_sel(
+            traj_past=ego_past_work,
+            acc_past=ego_acc_past_sel,
+            cur_acc_new=ego_cur_acc_new,
+            sel_i=sel_ego_ped,
+            Np=Np_ped,
+            Tsec=float(Np_ped) * self._dt,
+        )
+
+        ego_cur_new_frame = ego_past_work[:, t_cur, :]  # (Bk, 11)
+
+        _apply_future_interp_for_sel(
+            traj_future=ego_fut_work,
+            acc_future=ego_acc_fut_sel,
+            cur_past=ego_cur_new_frame,
+            cur_acc_new=ego_cur_acc_new,
+            sel_i=sel_ego_car,
+            Nf=Nf_car,
+            Tsec=float(Nf_car) * self._dt,
+        )
+        _apply_future_interp_for_sel(
+            traj_future=ego_fut_work,
+            acc_future=ego_acc_fut_sel,
+            cur_past=ego_cur_new_frame,
+            cur_acc_new=ego_cur_acc_new,
+            sel_i=sel_ego_cyc,
+            Nf=Nf_cyc,
+            Tsec=float(Nf_cyc) * self._dt,
+        )
+        _apply_future_interp_for_sel(
+            traj_future=ego_fut_work,
+            acc_future=ego_acc_fut_sel,
+            cur_past=ego_cur_new_frame,
+            cur_acc_new=ego_cur_acc_new,
+            sel_i=sel_ego_ped,
+            Nf=Nf_ped,
+            Tsec=float(Nf_ped) * self._dt,
+        )
+
+        # ---- (2) neighbor: 증강된 neighbor 인덱스를 1번만 뽑고, 타입으로 나눠서 재사용 ----
+        if A > 0:
+            aug_nbr_flat = aug_nbr_sel.reshape(-1)  # (Bk*A,)
+            sel_nbr_all = torch.nonzero(aug_nbr_flat, as_tuple=True)[0]  # (Mn,)
+
+            nbr_is_car_flat = nbr_is_car_sel.reshape(-1)
+            nbr_is_cyc_flat = nbr_is_cyc_sel.reshape(-1)
+            nbr_is_ped_flat = nbr_is_ped_sel.reshape(-1)
+
+            sel_nbr_car = sel_nbr_all[nbr_is_car_flat[sel_nbr_all]]
+            sel_nbr_cyc = sel_nbr_all[nbr_is_cyc_flat[sel_nbr_all]]
+            sel_nbr_ped = sel_nbr_all[nbr_is_ped_flat[sel_nbr_all]]
+
+            _apply_past_interp_for_sel(
+                traj_past=nbr_past_work,
+                acc_past=nbr_acc_past_sel,
+                cur_acc_new=nbr_cur_acc_new,
+                sel_i=sel_nbr_car,
                 Np=Np_car,
                 Tsec=float(Np_car) * self._dt,
             )
-        if bool(torch.any(ego_aug_cyc)):
-            _apply_past_interp_for_mask(
-                traj_past=ego_past_work,
-                acc_past=ego_acc_past_sel,
-                cur_acc_new=ego_cur_acc_new,
-                mask=ego_aug_cyc,
+            _apply_past_interp_for_sel(
+                traj_past=nbr_past_work,
+                acc_past=nbr_acc_past_sel,
+                cur_acc_new=nbr_cur_acc_new,
+                sel_i=sel_nbr_cyc,
                 Np=Np_cyc,
                 Tsec=float(Np_cyc) * self._dt,
             )
-        if bool(torch.any(ego_aug_ped)):
-            _apply_past_interp_for_mask(
-                traj_past=ego_past_work,
-                acc_past=ego_acc_past_sel,
-                cur_acc_new=ego_cur_acc_new,
-                mask=ego_aug_ped,
+            _apply_past_interp_for_sel(
+                traj_past=nbr_past_work,
+                acc_past=nbr_acc_past_sel,
+                cur_acc_new=nbr_cur_acc_new,
+                sel_i=sel_nbr_ped,
                 Np=Np_ped,
                 Tsec=float(Np_ped) * self._dt,
             )
 
-        # ---- future (ego) ----
-        # current state는 past[t_cur] 사용
-        ego_cur_new_frame = ego_past_work[:, t_cur, :]  # (Bk, 11)
-
-        if bool(torch.any(ego_aug_car)):
-            _apply_future_interp_for_mask(
-                traj_future=ego_fut_work,
-                acc_future=ego_acc_fut_sel,
-                cur_past=ego_cur_new_frame,
-                cur_acc_new=ego_cur_acc_new,
-                mask=ego_aug_car,
+            _apply_future_interp_for_sel(
+                traj_future=nbr_fut_work,
+                acc_future=nbr_acc_fut_sel,
+                cur_past=nbr_past_work[:, :, t_cur, :],
+                cur_acc_new=nbr_cur_acc_new,
+                sel_i=sel_nbr_car,
                 Nf=Nf_car,
                 Tsec=float(Nf_car) * self._dt,
             )
-        if bool(torch.any(ego_aug_cyc)):
-            _apply_future_interp_for_mask(
-                traj_future=ego_fut_work,
-                acc_future=ego_acc_fut_sel,
-                cur_past=ego_cur_new_frame,
-                cur_acc_new=ego_cur_acc_new,
-                mask=ego_aug_cyc,
+            _apply_future_interp_for_sel(
+                traj_future=nbr_fut_work,
+                acc_future=nbr_acc_fut_sel,
+                cur_past=nbr_past_work[:, :, t_cur, :],
+                cur_acc_new=nbr_cur_acc_new,
+                sel_i=sel_nbr_cyc,
                 Nf=Nf_cyc,
                 Tsec=float(Nf_cyc) * self._dt,
             )
-        if bool(torch.any(ego_aug_ped)):
-            _apply_future_interp_for_mask(
-                traj_future=ego_fut_work,
-                acc_future=ego_acc_fut_sel,
-                cur_past=ego_cur_new_frame,
-                cur_acc_new=ego_cur_acc_new,
-                mask=ego_aug_ped,
+            _apply_future_interp_for_sel(
+                traj_future=nbr_fut_work,
+                acc_future=nbr_acc_fut_sel,
+                cur_past=nbr_past_work[:, :, t_cur, :],
+                cur_acc_new=nbr_cur_acc_new,
+                sel_i=sel_nbr_ped,
                 Nf=Nf_ped,
                 Tsec=float(Nf_ped) * self._dt,
             )
 
-        # ---- neighbor past/future ----
-        if A > 0:
-            nbr_aug_car = aug_nbr_sel & nbr_is_car_sel
-            nbr_aug_cyc = aug_nbr_sel & nbr_is_cyc_sel
-            nbr_aug_ped = aug_nbr_sel & nbr_is_ped_sel
-
-            # past + future를 "같은 작업용 텐서"에 적용
-            if bool(torch.any(nbr_aug_car)):
-                _apply_past_interp_for_mask(
-                    traj_past=nbr_past_work,
-                    acc_past=nbr_acc_past_sel,
-                    cur_acc_new=nbr_cur_acc_new,
-                    mask=nbr_aug_car,
-                    Np=Np_car,
-                    Tsec=float(Np_car) * self._dt,
-                )
-                _apply_future_interp_for_mask(
-                    traj_future=nbr_fut_work,
-                    acc_future=nbr_acc_fut_sel,
-                    cur_past=nbr_past_work[:, :, t_cur, :],
-                    cur_acc_new=nbr_cur_acc_new,
-                    mask=nbr_aug_car,
-                    Nf=Nf_car,
-                    Tsec=float(Nf_car) * self._dt,
-                )
-
-            if bool(torch.any(nbr_aug_cyc)):
-                _apply_past_interp_for_mask(
-                    traj_past=nbr_past_work,
-                    acc_past=nbr_acc_past_sel,
-                    cur_acc_new=nbr_cur_acc_new,
-                    mask=nbr_aug_cyc,
-                    Np=Np_cyc,
-                    Tsec=float(Np_cyc) * self._dt,
-                )
-                _apply_future_interp_for_mask(
-                    traj_future=nbr_fut_work,
-                    acc_future=nbr_acc_fut_sel,
-                    cur_past=nbr_past_work[:, :, t_cur, :],
-                    cur_acc_new=nbr_cur_acc_new,
-                    mask=nbr_aug_cyc,
-                    Nf=Nf_cyc,
-                    Tsec=float(Nf_cyc) * self._dt,
-                )
-
-            if bool(torch.any(nbr_aug_ped)):
-                _apply_past_interp_for_mask(
-                    traj_past=nbr_past_work,
-                    acc_past=nbr_acc_past_sel,
-                    cur_acc_new=nbr_cur_acc_new,
-                    mask=nbr_aug_ped,
-                    Np=Np_ped,
-                    Tsec=float(Np_ped) * self._dt,
-                )
-                _apply_future_interp_for_mask(
-                    traj_future=nbr_fut_work,
-                    acc_future=nbr_acc_fut_sel,
-                    cur_past=nbr_past_work[:, :, t_cur, :],
-                    cur_acc_new=nbr_cur_acc_new,
-                    mask=nbr_aug_ped,
-                    Nf=Nf_ped,
-                    Tsec=float(Nf_ped) * self._dt,
-                )
-
-        # ✅ 핵심: 보간 결과를 원본 텐서에 "반드시" 반영
+        # ✅ 보간 결과를 원본 텐서에 "반드시" 반영
         ego_agent_past[idx_keep] = ego_past_work
         ego_future_11[idx_keep] = ego_fut_work
         if A > 0:
@@ -3515,48 +3530,41 @@ class NPCStatePerturbation:
         # -----------------------------
         origin_world_pose = inputs.get("origin_world_pose", None)
         if isinstance(origin_world_pose, torch.Tensor):
-            # ego가 실제로 perturb된 샘플만 (aug_ego True & final_aug_sample_mask True)
-            ego_aug_samples = aug_ego
-            if bool(torch.any(ego_aug_samples)):
-                # old ego current는 "증강 전" 값이 필요하지만, 보통 (0,0,1,0)이라 가정 가능.
-                # 더 안전하게: delta는 ego_cur_after - original ego_cur 를 사용
-                # (원본 ego_cur는 train_epoch 시작에서 ego_cur로 잡았던 값)
-                delta_px = ego_cur_after[:, self.IDX_X] - ego_cur[:, self.IDX_X]
-                delta_py = ego_cur_after[:, self.IDX_Y] - ego_cur[:, self.IDX_Y]
+            ego_aug_samples = aug_ego  # (B,)
 
-                # yaw delta: (cos,sin) -> yaw로 바꿔 차이
-                yaw_old = torch.atan2(ego_cur[:, self.IDX_SIN],
-                                      ego_cur[:, self.IDX_COS])
-                yaw_new = torch.atan2(ego_cur_after[:, self.IDX_SIN],
-                                      ego_cur_after[:, self.IDX_COS])
-                delta_yaw = _wrap_to_pi(yaw_new - yaw_old)
+            delta_px = ego_cur_after[:, self.IDX_X] - ego_cur[:, self.IDX_X]
+            delta_py = ego_cur_after[:, self.IDX_Y] - ego_cur[:, self.IDX_Y]
 
-                twx = origin_world_pose[:, 0]
-                twy = origin_world_pose[:, 1]
-                cw = origin_world_pose[:, 2]
-                sw = origin_world_pose[:, 3]
-                cw, sw = _normalize_cos_sin(cw, sw)
+            yaw_old = torch.atan2(ego_cur[:, self.IDX_SIN],
+                                  ego_cur[:, self.IDX_COS])
+            yaw_new = torch.atan2(ego_cur_after[:, self.IDX_SIN],
+                                  ego_cur_after[:, self.IDX_COS])
+            delta_yaw = _wrap_to_pi(yaw_new - yaw_old)
 
-                dtx, dty = _rot_vec_by_yaw(delta_px, delta_py, cw, sw)
-                twx_new = twx + dtx
-                twy_new = twy + dty
+            twx = origin_world_pose[:, 0]
+            twy = origin_world_pose[:, 1]
+            cw = origin_world_pose[:, 2]
+            sw = origin_world_pose[:, 3]
+            cw, sw = _normalize_cos_sin(cw, sw)
 
-                cdy = torch.cos(delta_yaw)
-                sdy = torch.sin(delta_yaw)
-                # yaw_w' = yaw_w + delta_yaw
-                cw_new = cw * cdy - sw * sdy
-                sw_new = sw * cdy + cw * sdy
-                cw_new, sw_new = _normalize_cos_sin(cw_new, sw_new)
+            dtx, dty = _rot_vec_by_yaw(delta_px, delta_py, cw, sw)
+            twx_new = twx + dtx
+            twy_new = twy + dty
 
-                origin_world_pose[:, 0] = torch.where(ego_aug_samples, twx_new,
-                                                      origin_world_pose[:, 0])
-                origin_world_pose[:, 1] = torch.where(ego_aug_samples, twy_new,
-                                                      origin_world_pose[:, 1])
-                origin_world_pose[:, 2] = torch.where(ego_aug_samples, cw_new,
-                                                      origin_world_pose[:, 2])
-                origin_world_pose[:, 3] = torch.where(ego_aug_samples, sw_new,
-                                                      origin_world_pose[:, 3])
+            cdy = torch.cos(delta_yaw)
+            sdy = torch.sin(delta_yaw)
+            cw_new = cw * cdy - sw * sdy
+            sw_new = sw * cdy + cw * sdy
+            cw_new, sw_new = _normalize_cos_sin(cw_new, sw_new)
 
+            origin_world_pose[:, 0] = torch.where(ego_aug_samples, twx_new,
+                                                  origin_world_pose[:, 0])
+            origin_world_pose[:, 1] = torch.where(ego_aug_samples, twy_new,
+                                                  origin_world_pose[:, 1])
+            origin_world_pose[:, 2] = torch.where(ego_aug_samples, cw_new,
+                                                  origin_world_pose[:, 2])
+            origin_world_pose[:, 3] = torch.where(ego_aug_samples, sw_new,
+                                                  origin_world_pose[:, 3])
         # 끝: inputs/outputs in-place 갱신 완료
         # 끝: inputs/outputs in-place 갱신 완료 직전(맨 마지막 return 직전)에 아래 한 줄 추가
         self._maybe_save_augmented_debug_png(
