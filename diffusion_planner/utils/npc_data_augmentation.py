@@ -7,7 +7,167 @@ import torch
 import os
 from typing import Any, Dict, Optional, Tuple, List
 Tensor = torch.Tensor
+from typing import Dict, Tuple
 
+_TRIU_PAIR_IDX_CACHE: Dict[Tuple[torch.device, int], Tuple[Tensor, Tensor]] = {}
+
+
+def _get_triu_pair_indices(device: torch.device, A: int) -> Tuple[Tensor, Tensor]:
+    """i<j인 (i,j) pair 인덱스를 캐시로 가져옵니다.
+
+    Args:
+        device (torch.device): 반환 텐서가 올라갈 디바이스.
+        A (int): agent 수.
+
+    Returns:
+        Tuple[Tensor, Tensor]:
+            - i_idx: shape (P,) long. i<j인 i 인덱스
+            - j_idx: shape (P,) long. i<j인 j 인덱스
+            여기서 P = A*(A-1)//2
+    """
+    key = (device, int(A))
+    cached = _TRIU_PAIR_IDX_CACHE.get(key, None)
+    if cached is not None:
+        return cached
+
+    ij = torch.triu_indices(int(A), int(A), offset=1, device=device)  # (2,P)
+    i_idx = ij[0]
+    j_idx = ij[1]
+    _TRIU_PAIR_IDX_CACHE[key] = (i_idx, j_idx)
+    return i_idx, j_idx
+
+
+def _obb_intersects_others_vs_others_augmask_fast(
+    oth_xy: Tensor,       # (B, A, 2)
+    oth_cs: Tensor,       # (B, A, 2) = (cos, sin)
+    oth_wl: Tensor,       # (B, A, 2) = (width, length)
+    oth_valid: Tensor,    # (B, A) bool
+    aug_mask: Tensor,     # (B, A) bool  (증강된 neighbor 표시)
+    eps: float = 1e-6,
+) -> Tensor:
+    """증강된 agent가 포함된 pair만 뽑아서(희소하게) SAT 충돌을 검사합니다.
+
+    핵심:
+        - 기존 구현은 (B,A,A) 전체 SAT를 다 계산한 뒤 pair_mask로 걸러서 낭비가 큽니다.
+        - 여기서는 i<j pair 인덱스를 만든 다음,
+          (aug_mask[i] or aug_mask[j]) 인 pair만 "리스트로 뽑아서" 그 pair에 대해서만 SAT를 계산합니다.
+        - 결과(어떤 pair라도 겹치면 True)는 기존과 동일합니다.
+
+    Args:
+        oth_xy (Tensor): shape (B, A, 2)
+        oth_cs (Tensor): shape (B, A, 2)
+        oth_wl (Tensor): shape (B, A, 2)
+        oth_valid (Tensor): shape (B, A) bool(또는 0/1)
+        aug_mask (Tensor): shape (B, A) bool(또는 0/1)
+        eps (float): 수치 안정용.
+
+    Returns:
+        Tensor: shape (B,) bool.
+            - True면 그 샘플에서 "증강된 neighbor가 포함된 어떤 pair"라도 겹칩니다.
+    """
+    if oth_xy.ndim != 3 or int(oth_xy.shape[-1]) != 2:
+        raise ValueError(f"oth_xy must be (B,A,2). got shape={tuple(oth_xy.shape)}")
+    if oth_cs.ndim != 3 or int(oth_cs.shape[-1]) != 2:
+        raise ValueError(f"oth_cs must be (B,A,2). got shape={tuple(oth_cs.shape)}")
+    if oth_wl.ndim != 3 or int(oth_wl.shape[-1]) != 2:
+        raise ValueError(f"oth_wl must be (B,A,2). got shape={tuple(oth_wl.shape)}")
+    if oth_valid.ndim != 2:
+        raise ValueError(f"oth_valid must be (B,A). got shape={tuple(oth_valid.shape)}")
+    if aug_mask.ndim != 2:
+        raise ValueError(f"aug_mask must be (B,A). got shape={tuple(aug_mask.shape)}")
+
+    B = int(oth_xy.shape[0])
+    A = int(oth_xy.shape[1])
+    if A <= 1:
+        return torch.zeros((B,), device=oth_xy.device, dtype=torch.bool)
+
+    if int(oth_cs.shape[0]) != B or int(oth_cs.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: oth_cs")
+    if int(oth_wl.shape[0]) != B or int(oth_wl.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: oth_wl")
+    if int(oth_valid.shape[0]) != B or int(oth_valid.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: oth_valid")
+    if int(aug_mask.shape[0]) != B or int(aug_mask.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: aug_mask")
+
+    device = oth_xy.device
+    vmask = _as_bool_mask(oth_valid)          # (B,A)
+    amask = _as_bool_mask(aug_mask)          # (B,A)
+
+    # (i,j) i<j pair 인덱스 (P,)
+    i_idx, j_idx = _get_triu_pair_indices(device, A)
+
+    # (B,P): "증강 포함 pair"만 True
+    pair_has_aug = amask[:, i_idx] | amask[:, j_idx]
+    # (B,P): 둘 다 valid인 pair만 True
+    pair_valid = vmask[:, i_idx] & vmask[:, j_idx]
+    pair_keep = pair_has_aug & pair_valid
+
+    sel = torch.nonzero(pair_keep, as_tuple=False)  # (M,2) where [:,0]=b, [:,1]=p
+    if int(sel.numel()) == 0:
+        return torch.zeros((B,), device=device, dtype=torch.bool)
+
+    b_idx = sel[:, 0]  # (M,)
+    p_idx = sel[:, 1]  # (M,)
+
+    ii = i_idx.index_select(0, p_idx)  # (M,)
+    jj = j_idx.index_select(0, p_idx)  # (M,)
+
+    # (M,2)로 pair의 두 박스만 뽑아서 SAT 계산 (완전 동일한 SAT 로직)
+    a_xy = oth_xy[b_idx, ii]  # (M,2)
+    b_xy = oth_xy[b_idx, jj]  # (M,2)
+
+    a_cs = oth_cs[b_idx, ii]  # (M,2)
+    b_cs = oth_cs[b_idx, jj]  # (M,2)
+
+    a_wl = oth_wl[b_idx, ii]  # (M,2)
+    b_wl = oth_wl[b_idx, jj]  # (M,2)
+
+    a_cos = a_cs[:, 0]
+    a_sin = a_cs[:, 1]
+    b_cos = b_cs[:, 0]
+    b_sin = b_cs[:, 1]
+
+    aW = 0.5 * a_wl[:, 0]
+    aL = 0.5 * a_wl[:, 1]
+    bW = 0.5 * b_wl[:, 0]
+    bL = 0.5 * b_wl[:, 1]
+
+    tx = b_xy[:, 0] - a_xy[:, 0]
+    ty = b_xy[:, 1] - a_xy[:, 1]
+
+    # t in A frame
+    tAx = tx * a_cos + ty * a_sin
+    tAy = -tx * a_sin + ty * a_cos
+
+    # Rotation matrix between A and B
+    R00 = a_cos * b_cos + a_sin * b_sin
+    R01 = a_cos * (-b_sin) + a_sin * b_cos
+    R10 = (-a_sin) * b_cos + a_cos * b_sin
+    R11 = (-a_sin) * (-b_sin) + a_cos * b_cos
+
+    eps_f = float(eps)
+    absR00 = torch.abs(R00) + eps_f
+    absR01 = torch.abs(R01) + eps_f
+    absR10 = torch.abs(R10) + eps_f
+    absR11 = torch.abs(R11) + eps_f
+
+    cond0 = torch.abs(tAx) <= (aL + bL * absR00 + bW * absR01)
+    cond1 = torch.abs(tAy) <= (aW + bL * absR10 + bW * absR11)
+
+    # t in B frame: tB = R^T * tA
+    tBx = tAx * R00 + tAy * R10
+    tBy = tAx * R01 + tAy * R11
+
+    cond2 = torch.abs(tBx) <= (bL + aL * absR00 + aW * absR10)
+    cond3 = torch.abs(tBy) <= (bW + aL * absR01 + aW * absR11)
+
+    hit = cond0 & cond1 & cond2 & cond3  # (M,)
+
+    # (B,)로 “어느 pair라도 hit면 True” 만들기
+    out_i32 = torch.zeros((B,), device=device, dtype=torch.int32)
+    out_i32.scatter_reduce_(0, b_idx, hit.to(torch.int32), reduce="amax", include_self=True)
+    return out_i32.to(torch.bool)
 
 def _as_bool_mask(mask: Tensor) -> Tensor:
     """마스크를 bool로 통일합니다.
@@ -2654,18 +2814,15 @@ class NPCStatePerturbation:
             if A > 1:
                 aug_nbr_sel_mask = aug_nbr[sel]  # (Bs, A)
                 any_aug_nbr_sel = torch.any(aug_nbr_sel_mask, dim=1)  # (Bs,)
-                idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[0]
+                idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[
+                    0]  # (Bs2,)
                 if int(idx_sub.numel()) != 0:
-                    pair_mask_sub = (aug_nbr_sel_mask[idx_sub, :, None] |
-                                     aug_nbr_sel_mask[
-                                         idx_sub, None, :])  # (Bs2,A,A)
-
-                    collide_sub = _obb_intersects_others_vs_others(
+                    collide_sub = _obb_intersects_others_vs_others_augmask_fast(
                         oth_xy=oth_xy_sel[idx_sub],
                         oth_cs=oth_cs_sel[idx_sub],
                         oth_wl=oth_wl_sel[idx_sub],
                         oth_valid=oth_valid_sel[idx_sub],
-                        pair_mask=pair_mask_sub,
+                        aug_mask=aug_nbr_sel_mask[idx_sub],
                     )  # (Bs2,)
                     collide_nbr_sel[idx_sub] = collide_sub
         else:
