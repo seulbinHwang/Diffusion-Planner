@@ -2703,10 +2703,15 @@ class SimpleSelfAttention(nn.Module):
             out_unpad = self.proj_drop(out_unpad)
 
             # pad back: (B*P, H) -> (B, P, H)
+            # pad back: (B*P, H) -> (B, P, H)
             out_flat = x.new_zeros((int(B) * int(P), int(H)))  # (B*P, H)
+
+            # ✅ 핵심: index_copy 전에 dtype 정합 (autocast로 out_unpad가 bf16이 될 수 있음)
+            if out_unpad.dtype != out_flat.dtype:
+                out_unpad = out_unpad.to(dtype=out_flat.dtype)
+
             out_flat = out_flat.index_copy(0, indices, out_unpad)
             out = out_flat.view(int(B), int(P), int(H))
-
             out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
             return out
 
