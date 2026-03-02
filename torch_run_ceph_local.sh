@@ -84,8 +84,10 @@ TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 
 # (로컬) 학습에 사용할 경로
-LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
-LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
+#LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
+#LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
+LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v_world"
+LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v_world/diffusion_planner_training.json"
 
 # 복사 강제 옵션: 1이면 항상 다시 복사
 FORCE_REBUILD=0
