@@ -110,7 +110,7 @@ FORCE_REBUILD=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2_no_amor" \
+    --name "use_npc_data_augment_true_use_body_vel_false" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -125,7 +125,7 @@ FORCE_REBUILD=0
     --max_grad_norm 1.0 \
     --prefetch_factor 8 \
     --feasible_learn_noise_thresh 1.0 \
-    --p_sat 0.25 \
+    --p_sat 0.5 \
     --w_dir 1.0 \
     --w_int_min 0.05 \
     --w_int_max 2.0 \
