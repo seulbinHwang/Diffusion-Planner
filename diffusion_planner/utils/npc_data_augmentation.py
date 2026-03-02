@@ -3592,21 +3592,22 @@ class NPCStatePerturbation:
                                                   origin_world_pose[:, 3])
         # 끝: inputs/outputs in-place 갱신 완료
         # 끝: inputs/outputs in-place 갱신 완료 직전(맨 마지막 return 직전)에 아래 한 줄 추가
-        self._maybe_save_augmented_debug_png(
-            inputs=inputs,
-            outputs=outputs,
-            idx_keep=idx_keep,  # (Bk,)
-            aug_ego=aug_ego,  # (B,)
-            aug_nbr=aug_nbr,  # (B,A)
-            debug_vis_dir=debug_vis_dir,
-            debug_step=debug_step,
-            debug_max_scenes=int(debug_max_scenes),
-            debug_every_n_steps=int(debug_every_n_steps),
-            past_stride=int(debug_past_stride),
-            future_stride=int(debug_future_stride),
-            vel_arrow_len_m=float(debug_vel_arrow_len_m),
-            debug_before_cache=debug_before_cache,
-            debug_frame_params_cache=debug_frame_params_cache,  # ✅ 추가
-
-        )
+        # ✅ debug_enabled가 True일 때만 저장 루틴 호출 (False면 호출 자체가 없음)
+        if debug_enabled:
+            self._maybe_save_augmented_debug_png(
+                inputs=inputs,
+                outputs=outputs,
+                idx_keep=idx_keep,  # (Bk,)
+                aug_ego=aug_ego,  # (B,)
+                aug_nbr=aug_nbr,  # (B,A)
+                debug_vis_dir=debug_vis_dir,
+                debug_step=debug_step,
+                debug_max_scenes=int(debug_max_scenes),
+                debug_every_n_steps=int(debug_every_n_steps),
+                past_stride=int(debug_past_stride),
+                future_stride=int(debug_future_stride),
+                vel_arrow_len_m=float(debug_vel_arrow_len_m),
+                debug_before_cache=debug_before_cache,
+                debug_frame_params_cache=debug_frame_params_cache,
+            )
         return

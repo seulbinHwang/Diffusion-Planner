@@ -1181,18 +1181,39 @@ def train_epoch(
     for batch in data_loader:
         inputs, outputs = _prepare_batch_for_device(batch, device=args.device)
         # ✅ (추가) 정규화 전에 증강 적용
+        # ✅ (추가) 정규화 전에 증강 적용
         if npc_state_augmenter is not None:
-            # ---- env로 시각화 on/off (argparse 추가 없이) ----
-            enable_vis = True
+            # ---- 시각화 on/off ----
+            enable_vis: bool = False  # train_epoch에서만 결정
 
-            debug_vis_dir: Optional[str] = None
             if enable_vis and _is_main_process():
-                # 경로를 명시하면 그 경로 사용, 없으면 save_path 아래 기본 폴더 사용
-                debug_vis_dir = os.environ.get("DP_NPC_AUG_VIS_DIR", "").strip()
+                debug_vis_dir: Optional[str] = os.environ.get(
+                    "DP_NPC_AUG_VIS_DIR", "").strip()
                 if debug_vis_dir == "":
                     debug_vis_dir = os.path.join(
                         str(getattr(args, "save_path", ".")), "npc_aug_vis")
-                print("debug_vis_dir:", debug_vis_dir)
+
+                debug_step: Optional[int] = int(
+                    getattr(args, "_global_update_step", 0))
+                debug_max_scenes: int = int(
+                    os.environ.get("DP_NPC_AUG_VIS_MAX_SCENES", "20"))
+                debug_every_n_steps: int = int(
+                    os.environ.get("DP_NPC_AUG_VIS_EVERY", "1"))
+                debug_past_stride: int = int(
+                    os.environ.get("DP_NPC_AUG_VIS_PAST_STRIDE", "1"))
+                debug_future_stride: int = int(
+                    os.environ.get("DP_NPC_AUG_VIS_FUTURE_STRIDE", "1"))
+                debug_vel_arrow_len_m: float = float(
+                    os.environ.get("DP_NPC_AUG_VIS_VEL_ARROW_LEN_M", "1.0"))
+            else:
+                # ✅ 완전 OFF: apply_inplace 내부에서 debug 관련 분기 자체가 절대 실행되지 않게
+                debug_vis_dir = None
+                debug_step = None
+                debug_max_scenes = 0
+                debug_every_n_steps = 1
+                debug_past_stride = 1
+                debug_future_stride = 1
+                debug_vel_arrow_len_m = 1.0
 
             npc_state_augmenter.apply_inplace(
                 inputs=inputs,
@@ -1201,19 +1222,14 @@ def train_epoch(
                 agent_prob=float(getattr(args, "augment_prob", 0.5)),
                 use_body_vel=bool(getattr(args, "use_body_vel", True)),
 
-                # ---- debug vis args (추가) ----
+                # ---- debug vis args ----
                 debug_vis_dir=debug_vis_dir,
-                debug_step=int(getattr(args, "_global_update_step", 0)),
-                debug_max_scenes=int(
-                    os.environ.get("DP_NPC_AUG_VIS_MAX_SCENES", "20")),
-                debug_every_n_steps=int(
-                    os.environ.get("DP_NPC_AUG_VIS_EVERY", "1")),
-                debug_past_stride=int(
-                    os.environ.get("DP_NPC_AUG_VIS_PAST_STRIDE", "1")),
-                debug_future_stride=int(
-                    os.environ.get("DP_NPC_AUG_VIS_FUTURE_STRIDE", "1")),
-                debug_vel_arrow_len_m=float(
-                    os.environ.get("DP_NPC_AUG_VIS_VEL_ARROW_LEN_M", "1.0")),
+                debug_step=debug_step,
+                debug_max_scenes=debug_max_scenes,
+                debug_every_n_steps=debug_every_n_steps,
+                debug_past_stride=debug_past_stride,
+                debug_future_stride=debug_future_stride,
+                debug_vel_arrow_len_m=debug_vel_arrow_len_m,
             )
         # 1) 관측 정규화
         norm_inputs: Dict[str,
