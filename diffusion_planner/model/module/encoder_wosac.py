@@ -2496,6 +2496,15 @@ class LaneFusionEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """차선 정보를 lane 단위 임베딩으로 바꿔 반환합니다.
 
+        D_lane = 12
+            각 차선의 한 점에 대해 다음 값을 이어 붙여 길이 12 벡터를 만든다.
+
+            - 현재 점 위치 (x, y)
+            - 이전 점과의 차이 벡터 (간단한 진행 방향 정보)
+            - 왼쪽 경계선까지의 상대 위치 (left - center)
+            - 오른쪽 경계선까지의 상대 위치 (right - center)
+            - 신호등 one-hot (길이 4)
+
         변경 요약
         ----------
         1) token_pre_project가 lane_len을 '작은 T'로 압축합니다.
