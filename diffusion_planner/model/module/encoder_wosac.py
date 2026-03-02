@@ -268,9 +268,14 @@ class Encoder(nn.Module):
             time_max=self.time_max,
         )
 
+        road_safety_numeric_hidden: int = int(
+            getattr(config, "road_safety_numeric_mlp_hidden_features", 640)
+        )
+
         self.road_safety_encoder = RoadSafetyFusionEncoder(
             hidden_dim=config.hidden_dim,
             out_drop_p=0.0,
+            numeric_mlp_hidden_features=road_safety_numeric_hidden,
         )
 
         self.lane_encoder = LaneFusionEncoder(
@@ -821,6 +826,10 @@ class Encoder(nn.Module):
 
         if (ego_agent_past is not None) and (near_agents_past is not None):
             # NEW
+            """
+            agents_xy : (B, 1+agent_num, 2)
+            agents_valid : (B, 1+agent_num)
+            """
             agents_xy, agents_valid = build_agents_xy_and_valid_from_past(
                 ego_agent_past=ego_agent_past,
                 near_agents_past=near_agents_past,
@@ -916,8 +925,8 @@ class Encoder(nn.Module):
                 ) = prune_lanes_by_distance_to_agents(
                     lanes=lanes,
                     lanes_is_valid=lanes_is_valid,
-                    agents_xy=agents_xy,
-                    agents_valid=agents_valid,
+                    agents_xy=agents_xy, # (B, 1+agent_num, 2)
+                    agents_valid=agents_valid, # (B, 1+agent_num)
                     topk=lane_prune_topk,
                     lanes_len_is_valid=lanes_len_is_valid,
                     lanes_speed_limit=lanes_speed_limit,
@@ -1769,22 +1778,29 @@ class RoadSafetyFusionEncoder(nn.Module):
       여기서 type_onehot은 마지막 인덱스(4)를 road_safety로 둡니다.
     """
 
+
     def __init__(
         self,
         hidden_dim: int = 192,
         ffn_ratio: float = 2.0,
         out_drop_p: float = 0.0,
+        numeric_mlp_hidden_features: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim: int = int(hidden_dim)
 
         # numeric feature: (cx, cy, dir_x, dir_y, extent_x, extent_y, length, closed_flag)
-        # ※ 임베딩용 feature는 기존 구조 유지(학습/호환성 영향 최소화)
         self._numeric_in_dim: int = 8
+
+        # ✅ numeric_mlp 폭 확장용(기본은 기존 방식, 지정하면 그 값 사용)
+        if numeric_mlp_hidden_features is None:
+            numeric_hidden: int = max(32, int(self.hidden_dim * float(ffn_ratio)))
+        else:
+            numeric_hidden = int(numeric_mlp_hidden_features)
 
         self.numeric_mlp = Mlp(
             in_features=self._numeric_in_dim,
-            hidden_features=max(32, int(self.hidden_dim * float(ffn_ratio))),
+            hidden_features=int(numeric_hidden),  # ✅ 여기만 640으로 키우면 됨
             out_features=self.hidden_dim,
             act_layer=nn.GELU,
             drop=0.0,
@@ -1803,7 +1819,6 @@ class RoadSafetyFusionEncoder(nn.Module):
         # 출력 정규화/드롭 (최종에 mask로 0 고정)
         self.out_norm = nn.LayerNorm(self.hidden_dim)
         self.out_drop = nn.Dropout(out_drop_p) if out_drop_p > 0 else nn.Identity()
-
     # ------------------------- 유틸 함수들 ------------------------- #
 
     @staticmethod
@@ -2866,9 +2881,11 @@ class FusionEncoder(nn.Module):
             drop_path_rate=0.2,
             depth=3,
             attn_drop_p: float = 0.025,  # 권장 0.0~0.1
-            ffn_drop_p: float = 0.05,  # 권장 0.0~0.1
+            ffn_drop_p: float = 0.05,    # 권장 0.0~0.1
             device='cuda'):
         super().__init__()
+
+        self._hidden_dim: int = int(hidden_dim)
 
         # 1) CLS/scene 토큰과 그 위치 임베딩
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -2890,58 +2907,130 @@ class FusionEncoder(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)
 
+        # ============================================================
+        # ✅ (추가) CLS 기반 토큰 보정 모듈
+        # - CLS(=장면 요약 1개 벡터)만 큰 MLP를 통과시켜 (scale,bias)를 만들고
+        # - 모든 토큰에 원소별로 token = token*(1+scale)+bias 를 적용
+        # - r=570, H=192 기준 약 329k params
+        # ============================================================
+        cls_mod_hidden: int = int(getattr(config, "fusion_cls_token_mod_mlp_hidden_dim", 570))
+        self.cls_token_mod_mlp = Mlp(
+            in_features=int(hidden_dim),
+            hidden_features=int(cls_mod_hidden),
+            out_features=int(2 * hidden_dim),
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+        # 초기에는 "아무 변화 없게"(scale=0, bias=0) 시작
+        # - token = token*(1+0)+0 = token
+        if hasattr(self.cls_token_mod_mlp, "fc2"):
+            nn.init.zeros_(self.cls_token_mod_mlp.fc2.weight)
+            if self.cls_token_mod_mlp.fc2.bias is not None:
+                nn.init.zeros_(self.cls_token_mod_mlp.fc2.bias)
+
+    def _apply_cls_token_modulation(
+        self,
+        cls_vec: torch.Tensor,    # (B, H)
+        tokens: torch.Tensor,     # (B, N, H)
+    ) -> torch.Tensor:
+        """CLS(장면 요약 벡터)로부터 토큰 보정값(scale/bias)을 만들고 토큰에 적용합니다.
+
+        Args:
+            cls_vec (torch.Tensor):
+                shape: (B, H)
+                각 배치의 장면 요약 벡터(CLS).
+            tokens (torch.Tensor):
+                shape: (B, N, H)
+                CLS를 제외한 토큰들.
+
+        Returns:
+            torch.Tensor:
+                shape: (B, N, H)
+                보정된 토큰들.
+                계산은 아래 형태입니다.
+                    scale, bias = MLP(cls_vec)  # (B, H), (B, H)
+                    tokens = tokens * (1 + scale) + bias
+        """
+        if cls_vec.dim() != 2:
+            raise ValueError(f"cls_vec must be (B, H). got {tuple(cls_vec.shape)}")
+        if tokens.dim() != 3:
+            raise ValueError(f"tokens must be (B, N, H). got {tuple(tokens.shape)}")
+
+        B, H = cls_vec.shape
+        if int(tokens.shape[0]) != int(B) or int(tokens.shape[2]) != int(H):
+            raise ValueError(
+                f"shape mismatch. cls_vec={(B, H)}, tokens={tuple(tokens.shape)}"
+            )
+
+        mod: torch.Tensor = self.cls_token_mod_mlp(cls_vec)  # (B, 2H)
+        scale, bias = mod.chunk(2, dim=-1)                   # (B, H), (B, H)
+
+        # dtype/device 안전
+        scale = scale.to(dtype=tokens.dtype, device=tokens.device)
+        bias = bias.to(dtype=tokens.dtype, device=tokens.device)
+
+        one: torch.Tensor = torch.ones((), device=tokens.device, dtype=tokens.dtype)
+        tokens = tokens * (one + scale.unsqueeze(1)) + bias.unsqueeze(1)  # (B, N, H)
+        return tokens
+
     def forward(
-            self, encoding_input: torch.Tensor,
-            encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            self,
+            encoding_input: torch.Tensor,   # (B, token_num, H)
+            encoding_mask: torch.Tensor     # (B, token_num) True=pad
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, token_num, H = encoding_input.shape
 
-        is_invalid_batch = encoding_mask.all(dim=1)  # [B]
-        is_valid_batch = ~is_invalid_batch  # [B]
-        out_tokens = encoding_input.new_zeros(B, token_num,
-                                              H)  # [B, token_num, H]
+        is_invalid_batch = encoding_mask.all(dim=1)  # (B,)
+        is_valid_batch = ~is_invalid_batch           # (B,)
+        out_tokens = encoding_input.new_zeros(B, token_num, H)  # (B, token_num, H)
 
         if is_valid_batch.any().item():
-            on_batch_tokens = encoding_input[is_valid_batch]
-            on_batch_token_mask = encoding_mask[is_valid_batch]
-            on_B: int = on_batch_tokens.size(0)
+            on_batch_tokens = encoding_input[is_valid_batch]          # (on_B, token_num, H)
+            on_batch_token_mask = encoding_mask[is_valid_batch]       # (on_B, token_num)
+            on_B: int = int(on_batch_tokens.size(0))
 
-            cls_tokens = self.cls_token.expand(on_B, 1,
-                                               H).to(on_batch_tokens.dtype)
-            cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens], dim=1)
+            cls_tokens = self.cls_token.expand(on_B, 1, H).to(on_batch_tokens.dtype)
+            cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens], dim=1)  # (on_B, 1+token_num, H)
+
             cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
             cls_with_tokens[:, 0:1, :] = cls_with_tokens[:, 0:1, :] + cls_pos
 
-            cls_false = torch.zeros(on_B,
-                                    1,
-                                    dtype=torch.bool,
-                                    device=on_batch_token_mask.device)
-            cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask],
-                                            dim=1)
+            cls_false = torch.zeros(
+                on_B, 1, dtype=torch.bool, device=on_batch_token_mask.device
+            )
+            cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask], dim=1)  # (on_B, 1+token_num)
 
             for block in self.blocks:
                 cls_with_tokens = block(cls_with_tokens, cls_with_token_mask)
 
-            cls_with_tokens = self.norm(cls_with_tokens)
-            cls_with_tokens = cls_with_tokens.masked_fill(
-                cls_with_token_mask.unsqueeze(-1), 0.0)
+            cls_with_tokens = self.norm(cls_with_tokens)  # (on_B, 1+token_num, H)
 
-            fused_wo_cls = cls_with_tokens[:, 1:, :]
+            # ✅ CLS 기반 보정 적용
+            cls_vec: torch.Tensor = cls_with_tokens[:, 0, :]      # (on_B, H)
+            fused_wo_cls: torch.Tensor = cls_with_tokens[:, 1:, :]  # (on_B, token_num, H)
+            fused_wo_cls = self._apply_cls_token_modulation(cls_vec=cls_vec, tokens=fused_wo_cls)
+
+            # ✅ pad 토큰은 다시 0으로 고정
+            fused_wo_cls = fused_wo_cls.masked_fill(on_batch_token_mask.unsqueeze(-1), 0.0)
+
             out_tokens[is_valid_batch] = fused_wo_cls.to(out_tokens.dtype)
 
         else:
-            # 모든 배치가 패딩이면, 파라미터들을 0-스케일로 "한 번에" 터치해서 DDP unused param 방지
-            touch = (self.cls_token[..., :1].sum() +
-                     self.cls_pos[..., :1].sum())
+            # 모든 배치가 패딩이면, 파라미터들을 0-스케일로 터치해서 DDP unused param 방지
+            touch = (self.cls_token[..., :1].sum() + self.cls_pos[..., :1].sum())
 
             for blk in self.blocks:
                 for p in blk.parameters():
                     touch = touch + p.view(-1)[:1].sum()
 
-            # ✅ self.norm 파라미터도 touch에 포함
             for p in self.norm.parameters():
                 touch = touch + p.view(-1)[:1].sum()
 
-            # ✅ touch를 다 만든 다음 out_tokens에 한 번만 반영
+            # ✅ 새로 추가된 CLS 보정 MLP도 포함
+            for p in self.cls_token_mod_mlp.parameters():
+                touch = touch + p.view(-1)[:1].sum()
+
             out_tokens = out_tokens + touch * 0.0
 
         return out_tokens, encoding_mask
