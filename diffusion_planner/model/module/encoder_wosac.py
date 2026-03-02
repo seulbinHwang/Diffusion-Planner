@@ -820,6 +820,7 @@ class Encoder(nn.Module):
                                                None)
 
         if (ego_agent_past is not None) and (near_agents_past is not None):
+            # NEW
             agents_xy, agents_valid = build_agents_xy_and_valid_from_past(
                 ego_agent_past=ego_agent_past,
                 near_agents_past=near_agents_past,
@@ -901,6 +902,7 @@ class Encoder(nn.Module):
                     enabled=self.config.profile_feasible,
                     device_type=device_type,
             ):
+                # NEW
                 (
                     lanes,
                     lanes_is_valid,
@@ -968,6 +970,7 @@ class Encoder(nn.Module):
                     enabled=self.config.profile_feasible,
                     device_type=device_type,
             ):
+                # NEW
                 (
                     stop_sign_points,
                     stop_sign_is_valid,
