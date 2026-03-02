@@ -347,10 +347,10 @@ def get_args():
                         help='filter_radius meter')
     parser.add_argument('--lane_prune_topk',
                         type=int,
-                        default=225)
+                        default=200)
     parser.add_argument('--road_safety_prune_topk',
                         type=int,
-                        default=40)
+                        default=35)
     parser.add_argument('--road_edge_prune_topk',
                         type=int,
                         default=50)
