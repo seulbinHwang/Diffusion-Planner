@@ -107,17 +107,17 @@ FORCE_REBUILD=0
 #
 ### ---- 학습은 로컬 데이터로 ----
 "$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
-  --nnodes 1 --nproc-per-node 1 --standalone \
+  --nnodes 1 --nproc-per-node 6 --standalone \
   "${TORCHRUN_LOG_ARGS[@]}" \
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "use_npc_data_augment_true_use_body_vel_false" \
-    --batch_size 256 \
+    --name "new_decoder_use_body_vel_false" \
+    --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --pose_based False \
-    --profile_feasible True \
+    --profile_feasible False \
     --use_feasible True \
     --use_feasible_dl False \
     --use_feasible_filter False \
@@ -137,4 +137,5 @@ FORCE_REBUILD=0
     --integration_yaw_weight 2. \
     --use_amortized_diffusion False \
     --use_body_vel False \
-    --use_npc_data_augment True
+    --use_npc_data_augment False \
+    --ca_topk_k 32
