@@ -125,7 +125,7 @@ def get_args():
     parser.add_argument('--eval_method',
                         type=str,
                         help='data list of validation data',
-                        default="validation") # or "test"
+                        default="validation")  # or "test"
     parser.add_argument('--run_count',
                         type=int,
                         help='number of run_count',
@@ -134,9 +134,7 @@ def get_args():
                         type=int,
                         help='number of run_count',
                         default=-1)
-    parser.add_argument('--rollout_number',
-                        type=int,
-                        default=32)
+    parser.add_argument('--rollout_number', type=int, default=32)
     parser.add_argument('--future_len',
                         type=int,
                         help='number of time point',
@@ -195,12 +193,8 @@ def get_args():
                         default=False,
                         type=boolean,
                         help='save_inference_data')
-    parser.add_argument('--save_integration_traj',
-                        default=False,
-                        type=boolean)
-    parser.add_argument('--rollout_step_count_for_save',
-                        type=int,
-                        default=-1)
+    parser.add_argument('--save_integration_traj', default=False, type=boolean)
+    parser.add_argument('--rollout_step_count_for_save', type=int, default=-1)
     parser.add_argument('--static_objects_state_dim',
                         type=int,
                         help='state dim for static objects',
@@ -256,10 +250,8 @@ def get_args():
         "--resume_wosac_submission",
         default=False,
         type=boolean,
-        help=(
-            "True이면, validation/test에서 이전 실행으로 만들어진 "
-            "wosac_submission 결과 폴더를 지우지 않고 이어서 저장합니다."
-        ),
+        help=("True이면, validation/test에서 이전 실행으로 만들어진 "
+              "wosac_submission 결과 폴더를 지우지 않고 이어서 저장합니다."),
     )
     # DataLoader parameters
     parser.add_argument('--augment_prob',
@@ -282,7 +274,8 @@ def get_args():
     #                     help='filepath of normalization.json',
     #                     type=str)
     parser.add_argument('--use_amortized_diffusion', default=True, type=boolean)
-    parser.add_argument('--validate_scenario_rollouts', default=False,
+    parser.add_argument('--validate_scenario_rollouts',
+                        default=False,
                         type=boolean)
     parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
@@ -299,11 +292,9 @@ def get_args():
         '--use_agent_route_lane_order',
         default=False,
         type=boolean,
-        help=(
-            "True이면 agent_route_lane_order를 dataset/배치에 포함합니다. "
-            "학습에서 사용하지 않으면 False로 두면 CPU/RAM 사용을 줄일 수 있습니다."
-        ),
-    ) # use_past_for_feasible = True / use_past_dit_input = True
+        help=("True이면 agent_route_lane_order를 dataset/배치에 포함합니다. "
+              "학습에서 사용하지 않으면 False로 두면 CPU/RAM 사용을 줄일 수 있습니다."),
+    )  # use_past_for_feasible = True / use_past_dit_input = True
 
     parser.add_argument('--use_fallback', default=True, type=boolean)
     parser.add_argument('--pin_mem', default=True, type=boolean)
@@ -345,15 +336,9 @@ def get_args():
                         type=float,
                         default=150.,
                         help='filter_radius meter')
-    parser.add_argument('--lane_prune_topk',
-                        type=int,
-                        default=200)
-    parser.add_argument('--road_safety_prune_topk',
-                        type=int,
-                        default=35)
-    parser.add_argument('--road_edge_prune_topk',
-                        type=int,
-                        default=50)
+    parser.add_argument('--lane_prune_topk', type=int, default=200)
+    parser.add_argument('--road_safety_prune_topk', type=int, default=35)
+    parser.add_argument('--road_edge_prune_topk', type=int, default=50)
     parser.add_argument(
         '--pruning_use_batch_max_k',
         default=True,
@@ -381,10 +366,7 @@ def get_args():
                         type=int,
                         help='epochs of training',
                         default=550)
-    parser.add_argument('--ca_topk_k',
-                        type=int,
-                        help='ca_topk_k',
-                        default=64)
+    parser.add_argument('--ca_topk_k', type=int, help='ca_topk_k', default=64)
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',
@@ -469,7 +451,6 @@ def get_args():
         help='decoder(Group C)에 곱해질 lr 배율.',
     )
 
-
     parser.add_argument('--encoder_drop_path_rate',
                         type=float,
                         help='encoder drop out rate',
@@ -531,9 +512,7 @@ def get_args():
                         type=boolean,
                         default=False,
                         help="ZeRO-2 옵티마 상태를 CPU 메모리로 일부 옮겨서 GPU 메모리를 더 아낄지 여부")
-    parser.add_argument("--do_data_statistics",
-                        type=boolean,
-                        default=False)
+    parser.add_argument("--do_data_statistics", type=boolean, default=False)
     parser.add_argument("--ds_steps_per_print",
                         type=int,
                         default=10000,
@@ -576,7 +555,9 @@ def get_args():
     parser.add_argument('--notes', default='', type=str)
     parser.add_argument('--entity', default='jksg01019-naver-labs', type=str)
     parser.add_argument('--project', default='Diffusion-Planner', type=str)
-    parser.add_argument('--histogram_output_dir', default='histograms', type=str)
+    parser.add_argument('--histogram_output_dir',
+                        default='histograms',
+                        type=str)
 
     # distributed training parameters
     parser.add_argument('--ddp',
@@ -637,21 +618,11 @@ def get_args():
                         type=int,
                         default=1,
                         help='limit total number of scenarios')
-    parser.add_argument('--fine_tune_gen_k',
-                        type=int,
-                        default=64)
-    parser.add_argument('--eval_temperature',
-                        type=float,
-                        default=0.2)
-    parser.add_argument('--fine_tune_temperature',
-                        type=float,
-                        default=0.5)
-    parser.add_argument('--time_step_for_compare',
-                        type=int,
-                        default=20)
-    parser.add_argument('--time_step_for_recover',
-                        type=int,
-                        default=30)
+    parser.add_argument('--fine_tune_gen_k', type=int, default=64)
+    parser.add_argument('--eval_temperature', type=float, default=0.2)
+    parser.add_argument('--fine_tune_temperature', type=float, default=0.5)
+    parser.add_argument('--time_step_for_compare', type=int, default=20)
+    parser.add_argument('--time_step_for_recover', type=int, default=30)
     parser.add_argument('--shuffle_scenarios',
                         type=boolean,
                         default=False,
@@ -682,12 +653,8 @@ def get_args():
     parser.add_argument('--die_all', default=True, type=boolean)
     parser.add_argument('--select_jointly', default=True, type=boolean)
     parser.add_argument('--use_recovery', default=False, type=boolean)
-    parser.add_argument('--recovery_threshold_m',
-                        type=float,
-                        default=3.)
-    parser.add_argument('--guidance_scale',
-                        type=float,
-                        default=1.)
+    parser.add_argument('--recovery_threshold_m', type=float, default=3.)
+    parser.add_argument('--guidance_scale', type=float, default=1.)
     parser.add_argument('--dp_sample_k_candidate_batch_size',
                         type=float,
                         default=-1.)

@@ -2809,6 +2809,7 @@ def _predict_rollouts_batched_one_chunk(
     use_amortized = bool(getattr(args, "use_amortized_diffusion", False))
     pose_based_flag = bool(getattr(args, "pose_based", True))
     inference_noise_bank: Optional[torch.Tensor] = None
+    amortized_eps_bank: Optional[torch.Tensor] = None
     with torch.inference_mode():
         step_start = 0
         while step_start < future_len:
@@ -2842,6 +2843,22 @@ def _predict_rollouts_batched_one_chunk(
                     ddp_rank=int(ddp_rank),
                     pose_based=bool(pose_based_flag),
                     noise_std=float(getattr(args, "eval_temperature", 0.5)),
+                )
+            # ✅ (추가) amortized면 eps_bank를 최초 1회만 생성 (표준정규, 길이=2T)
+            if use_amortized and (amortized_eps_bank is None):
+                amortized_eps_bank = _build_inference_noise_bank_for_rollout_batch(
+                    device=device,
+                    dtype=dtype,
+                    batch_size=int(batch_size),
+                    one_or_pnn=int(one_or_pnn),
+                    future_len=int(future_len),
+                    rollout_start_idx=int(rollout_start_idx),
+                    rollout_repeat=int(rollout_repeat),
+                    base_seed=int(base_seed),
+                    ddp_rank=int(ddp_rank),
+                    pose_based=bool(pose_based_flag),
+                    noise_std=float(getattr(args, "eval_temperature", 0.5)),
+                    # ✅ 변경: 1.0 -> eval_temperature
                 )
 
             # (A) 첫 스텝(step_start==0) 또는 non-amortized에서는 inference_noise를 넣음
@@ -2879,29 +2896,31 @@ def _predict_rollouts_batched_one_chunk(
             else:
                 inference_noise = None
 
-            # (B) amortized + step_start>0에서는 Decoder 내부 랜덤 대신 표준정규 노이즈 전달
+            # (B) amortized: eps bank를 step_start에 맞게 슬라이스해서 전달
             if use_amortized:
-                amortized_random_noise = _build_inference_noise_for_rollout_chunk(
-                    device=device,
-                    dtype=dtype,
-                    batch_size=int(batch_size),
-                    one_or_pnn=int(one_or_pnn),
+                if amortized_eps_bank is None:
+                    raise RuntimeError(
+                        "use_amortized_diffusion=True 인데 amortized_eps_bank가 준비되지 않았습니다."
+                    )
+
+                amortized_random_noise = _slice_amortized_eps_from_bank(
+                    eps_bank=amortized_eps_bank,  # (B*R, A, 2T, D)
+                    step_start=int(step_start),
                     future_len=int(future_len),
-                    rollout_start_idx=int(rollout_start_idx),
-                    rollout_repeat=int(rollout_repeat),
-                    base_seed=int(base_seed),
-                    ddp_rank=int(ddp_rank),
-                    step_idx=int(step_start),
-                    pose_based=bool(pose_based_flag),
-                    noise_std=1.0,
-                )
+                    gap=int(gap),
+                )  # step0: (B*R,A,T,D), 이후: (B*R,A,gap,D)
             else:
                 amortized_random_noise = None
 
             norm_inputs_b_r_copy["inference_noise"] = inference_noise
             norm_inputs_b_r_copy[
                 "amortized_random_noise"] = amortized_random_noise
-
+            # step_start==0일 때만: warm-up full은 amortized_random_noise로,
+            # shift에 쓸 tail은 별도 키로 같이 넣기
+            if use_amortized and int(step_start) == 0:
+                # bank: (B*R, A, 2T, D)
+                norm_inputs_b_r_copy["amortized_random_noise_tail"] = \
+                amortized_eps_bank[:, :, future_len:future_len + gap, :]
             norm_inputs_b_r_copy["rollout_time_chunk_size"] = torch.full(
                 (merged_batch,),
                 int(gap),
@@ -2964,6 +2983,8 @@ def _predict_rollouts_batched_one_chunk(
                     norm_inputs_for_draw = dict(norm_inputs_b_r_copy)
                     norm_inputs_for_draw.pop("inference_noise", None)
                     norm_inputs_for_draw.pop("amortized_random_noise", None)
+                    norm_inputs_for_draw.pop("amortized_random_noise_tail",
+                                             None)
                 """
                 unnorm_inputs_np: 그림용 입력 스냅샷(dict, 원래 단위, numpy 중심)
                 unnorm_trajectory_np: 모델 예측 궤적(원래 단위, numpy)
@@ -3473,6 +3494,68 @@ def _build_inference_noise_bank_for_rollout_batch(
         pose_based=bool(pose_based),
         noise_std=float(noise_std),
     )
+
+
+def _slice_amortized_eps_from_bank(
+    eps_bank: torch.Tensor,  # (B*R, A, bank_len, D)
+    *,
+    step_start: int,
+    future_len: int,
+    gap: int,
+) -> torch.Tensor:
+    """amortized용 표준정규 노이즈(eps)를 bank에서 잘라 반환합니다.
+
+    규칙
+    ----
+    - step_start == 0: warm-up에서 eps 전체(T)가 필요 → (B*R, A, T, D)
+    - step_start > 0 : AR 업데이트에서 tail(gap)만 필요 → (B*R, A, gap, D)
+
+    Args:
+        eps_bank (torch.Tensor):
+            미리 만들어 둔 긴 eps 텐서.
+            shape: (B*R, A, bank_len, D)  (bank_len은 보통 2*future_len)
+        step_start (int):
+            현재까지 진행한 스텝(0부터). shape: ()
+        future_len (int):
+            한 번 예측에서 쓰는 미래 길이 T. shape: ()
+        gap (int):
+            이번 chunk에서 앞으로 나아갈 스텝 수. shape: ()
+
+    Returns:
+        torch.Tensor:
+            - step_start==0: (B*R, A, future_len, D)
+            - step_start>0 : (B*R, A, gap, D)
+    """
+    if eps_bank.dim() != 4:
+        raise ValueError("eps_bank는 (B*R, A, bank_len, D) 형태여야 합니다. "
+                         f"got shape={tuple(eps_bank.shape)}")
+
+    s = int(step_start)
+    T = int(future_len)
+    g = int(gap)
+
+    if T <= 0:
+        raise ValueError(f"future_len은 1 이상이어야 합니다. future_len={future_len}")
+    if g <= 0:
+        raise ValueError(f"gap은 1 이상이어야 합니다. gap={gap}")
+
+    bank_len = int(eps_bank.shape[2])
+
+    # step 0: warm-up용 전체 eps
+    if s == 0:
+        if T > bank_len:
+            raise ValueError(
+                f"eps_bank 길이가 부족합니다. need={T}, bank_len={bank_len}")
+        return eps_bank[:, :, 0:T, :]
+
+    # step > 0: tail(gap)만
+    start = s + T
+    end = start + g
+    if start < 0 or end > bank_len:
+        raise ValueError(
+            "eps_bank 길이가 부족합니다. "
+            f"step_start={s}, future_len={T}, gap={g}, bank_len={bank_len}")
+    return eps_bank[:, :, start:end, :]
 
 
 def _slice_inference_noise_from_bank(
