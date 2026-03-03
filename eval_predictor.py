@@ -4756,6 +4756,149 @@ def _initialize_unnorm_inputs_for_rollout(
     return unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
 
 
+def _enforce_unit_cos_sin_in_state_11_inplace(
+    state_11: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> None:
+    """state_11의 (cos, sin)을 유효 마스크 기반으로 "길이 1"로 강제합니다.
+
+    목표
+    ----
+    - valid_mask=True 인 위치:
+        (cos, sin)의 길이를 1로 맞춥니다.
+        norm이 너무 작으면(=거의 0이면) (1, 0)으로 둡니다.
+    - valid_mask=False 인 위치:
+        (cos, sin)을 반드시 (0, 0)으로 유지합니다.
+
+    왜 필요한가?
+    ------------
+    closed-loop에서는 past가 여러 번 회전/이동 변환을 누적해서 받습니다.
+    회전은 원칙적으로 길이를 보존하지만, 실제 계산에서는 작은 오차가 쌓일 수 있습니다.
+    그래서 "다음 모델 입력으로 넣기 직전"에 한 번 더 정리해,
+    학습 때 보던 입력 분포(유효점은 길이 1, 무효점은 0)를 유지합니다.
+
+    Args:
+        state_11 (torch.Tensor):
+            상태 텐서.
+            shape: (..., 11)
+            여기서 state_11[..., 2] = cos, state_11[..., 3] = sin 입니다.
+        valid_mask (torch.Tensor):
+            유효 마스크.
+            shape: state_11.shape[:-1]
+            dtype는 bool/0-1/float 등 어떤 형태여도 됩니다(0이 아니면 True로 처리).
+        eps (float):
+            0 나눗셈 방지용 최소값.
+
+    Returns:
+        None
+    """
+    if not isinstance(state_11, torch.Tensor):
+        raise TypeError("state_11은 torch.Tensor여야 합니다.")
+    if state_11.dim() < 1 or int(state_11.shape[-1]) != 11:
+        raise ValueError(
+            "state_11은 (..., 11) 형태여야 합니다. "
+            f"got shape={tuple(state_11.shape)}"
+        )
+    if not torch.is_floating_point(state_11):
+        raise TypeError("state_11은 float 텐서여야 합니다.")
+
+    if not isinstance(valid_mask, torch.Tensor):
+        raise TypeError("valid_mask는 torch.Tensor여야 합니다.")
+
+    expected_mask_shape = tuple(int(x) for x in state_11.shape[:-1])
+    got_mask_shape = tuple(int(x) for x in valid_mask.shape)
+    if got_mask_shape != expected_mask_shape:
+        raise ValueError(
+            "valid_mask shape가 state_11과 맞지 않습니다. "
+            f"expected={expected_mask_shape}, got={got_mask_shape}"
+        )
+
+    # valid_mask: ( ... ) -> bool
+    if valid_mask.dtype == torch.bool:
+        vm = valid_mask
+    else:
+        vm = (valid_mask != 0)
+    vm = vm.to(device=state_11.device, dtype=torch.bool)
+
+    cos_v = state_11[..., 2]  # shape: (...)
+    sin_v = state_11[..., 3]  # shape: (...)
+
+    # norm: shape (...)
+    raw_norm = torch.sqrt(cos_v * cos_v + sin_v * sin_v)
+    safe_norm = torch.clamp(raw_norm, min=float(eps))
+
+    cos_n = cos_v / safe_norm
+    sin_n = sin_v / safe_norm
+
+    # valid인데 norm이 너무 작으면(거의 0) 기본값 (1,0)로
+    too_small = raw_norm < float(eps)
+    cos_n = torch.where(too_small, torch.ones_like(cos_n), cos_n)
+    sin_n = torch.where(too_small, torch.zeros_like(sin_n), sin_n)
+
+    # ✅ 유효/무효 분리 적용:
+    # - valid(True): cos_n/sin_n
+    # - invalid(False): 0/0
+    cos_out = torch.where(vm, cos_n, torch.zeros_like(cos_n))
+    sin_out = torch.where(vm, sin_n, torch.zeros_like(sin_n))
+
+    state_11[..., 2] = cos_out
+    state_11[..., 3] = sin_out
+
+
+def _enforce_unit_cos_sin_in_past_inputs_inplace(
+    unnorm_inputs_b_r_copy: Dict[str, Any],
+    eps: float = 1e-8,
+) -> None:
+    """rollout 입력 dict의 past 상태들(ego/near/neighbor/non_near)의 (cos,sin)을 정리합니다.
+
+    대상 키(존재할 때만 처리)
+    -----------------------
+    - ego_agent_past            + ego_agent_past_is_valid
+    - near_agents_past          + near_agents_past_is_valid
+    - neighbor_agents_past      + neighbor_agents_past_is_valid   (있으면)
+    - non_near_agents_past      + non_near_agents_past_is_valid   (있으면)
+
+    Args:
+        unnorm_inputs_b_r_copy (Dict[str, Any]):
+            unnorm 입력 dict.
+            - 예: ego_agent_past: (B*R, T_past, 11)
+            - 예: near_agents_past: (B*R, Pnn, T_past, 11)
+        eps (float):
+            0 나눗셈 방지용 최소값.
+
+    Returns:
+        None
+    """
+    if not isinstance(unnorm_inputs_b_r_copy, dict):
+        raise TypeError("unnorm_inputs_b_r_copy는 dict여야 합니다.")
+
+    targets = [
+        ("ego_agent_past", "ego_agent_past_is_valid"),
+        ("near_agents_past", "near_agents_past_is_valid"),
+        ("neighbor_agents_past", "neighbor_agents_past_is_valid"),
+        ("non_near_agents_past", "non_near_agents_past_is_valid"),
+    ]
+
+    for state_key, valid_key in targets:
+        state = unnorm_inputs_b_r_copy.get(state_key, None)
+        valid = unnorm_inputs_b_r_copy.get(valid_key, None)
+
+        # 키가 없거나 None이면 스킵
+        if state is None or valid is None:
+            continue
+        if not isinstance(state, torch.Tensor) or state.numel() == 0:
+            continue
+        if not isinstance(valid, torch.Tensor) or valid.numel() == 0:
+            continue
+
+        _enforce_unit_cos_sin_in_state_11_inplace(
+            state_11=state,
+            valid_mask=valid,
+            eps=float(eps),
+        )
+
+
 def _build_norm_inputs_from_unnorm_inputs(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_outputs_b_r_copy: Dict[str, Any],
@@ -4764,10 +4907,11 @@ def _build_norm_inputs_from_unnorm_inputs(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """현재 unnorm 입력을 모델 입력용 norm dict로 만듭니다.
 
-    목표
-    ----
-    - 좌표 변환은 unnorm에서 수행합니다.
-    - 모델 입력은 norm 값이 필요하므로, step마다 unnorm -> norm을 1번만 합니다.
+    ✅ 추가된 핵심
+    - "다음 forward 직전"에 past 상태(ego/near/...)의 (cos, sin)을
+      유효 마스크 기반으로 정규화합니다.
+      - 유효: 길이 1
+      - 무효: (0,0)
 
     Args:
         unnorm_inputs_b_r_copy (Dict[str, Any]):
@@ -4775,26 +4919,39 @@ def _build_norm_inputs_from_unnorm_inputs(
             주요 shape 예:
               - ego_agent_past: (B*R, T_past, 11)
               - near_agents_past: (B*R, Pnn, T_past, 11)
-              - lanes: (B*R, lane_num, lane_len, 12)
+        unnorm_outputs_b_r_copy (Dict[str, Any]):
+            원래 단위(unnorm) 출력/정답 dict.
         state_normalizer (StateNormalizer):
-            (x, y, cos, sin) 4개 값에 대한 정규화 도구.
+            (x, y, cos, sin) / (vx, vy, yaw_rate) 정규화 도구.
         observation_normalizer (ObservationNormalizer):
             입력 dict 여러 키에 대한 정규화 도구.
 
+    Returns:
+        Tuple[Dict[str, Any], Dict[str, Any]]:
+            (norm_inputs_b_r_step, norm_outputs_b_r_step)
     """
+    # ✅ (추가) forward 직전: past 전체 cos/sin 정규화(유효/무효 분리)
+    _enforce_unit_cos_sin_in_past_inputs_inplace(
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+        eps=1e-8,
+    )
+
     norm_inputs_b_r_step: Dict[str, Any] = observation_normalizer(
-        unnorm_inputs_b_r_copy)
-    norm_outputs_b_r_step = {
-        k: v.clone() for k, v in unnorm_outputs_b_r_copy.items()
-    }
+        unnorm_inputs_b_r_copy
+    )
+
+    norm_outputs_b_r_step = {k: v.clone() for k, v in unnorm_outputs_b_r_copy.items()}
+
     norm_outputs_b_r_step["ego_future_gt_4_dim"] = state_normalizer(
         data=unnorm_outputs_b_r_copy["ego_future_gt_4_dim"],
-        valid_mask=unnorm_outputs_b_r_copy["ego_future_gt_is_valid"])
-    # (B, Pnn, future_len, 4)
+        valid_mask=unnorm_outputs_b_r_copy["ego_future_gt_is_valid"],
+    )
+
     norm_outputs_b_r_step["near_future_gt_4_dim"] = state_normalizer(
         data=unnorm_outputs_b_r_copy["near_future_gt_4_dim"],
-        valid_mask=unnorm_outputs_b_r_copy["near_future_gt_is_valid"])
-    # (B, (1+)Pnn, future_len, 3)
+        valid_mask=unnorm_outputs_b_r_copy["near_future_gt_is_valid"],
+    )
+
     norm_outputs_b_r_step["future_seg_control_gt_3_dim"] = state_normalizer(
         data=norm_outputs_b_r_step["future_seg_control_gt_3_dim"],
         valid_mask=norm_outputs_b_r_step["future_seg_control_is_valid"],
