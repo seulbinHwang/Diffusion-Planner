@@ -2376,6 +2376,14 @@ def _predict_one_rollout_sequential(
     target_id = unnorm_inputs_copy.get(
         "target_id", None)  # length (1+Pnn) list of torch.Tensor
 
+    # ✅ (추가) rollout 내에서 cand_idx별로 공유되는 noise bank 캐시
+    # key: cand_idx(0..K-1), value: (B, 1+Pnn, bank_len, 4 or 3)
+    inference_noise_bank_cache: Dict[int, torch.Tensor] = {}
+    inference_noise_bank_len: int = _compute_inference_noise_bank_len(
+        scenario_finish_step=int(scenario_finish_step),
+        future_len=int(future_len),
+    )
+
     # ✅ GT 미래를 norm_inputs에 1번만 넣어 둡니다.
     cached_valid_masks: Dict[
         str, torch.Tensor] = _build_cached_valid_masks_for_static_map_features(
@@ -2434,6 +2442,9 @@ def _predict_one_rollout_sequential(
                 ddp_rank=int(ddp_rank),
                 step_idx=int(step_start),
                 gap=gap,
+                # ✅ (추가) noise bank 전달
+                inference_noise_bank_cache=inference_noise_bank_cache,
+                inference_noise_bank_len=int(inference_noise_bank_len),
             )
 
             # (B, 1+Pnn, future_len), (B, 1+Pnn, 1+future_len)
@@ -3501,6 +3512,207 @@ def _repeat_inputs_for_candidate_batch(
     return out
 
 
+def _compute_inference_noise_bank_len(
+    *,
+    scenario_finish_step: int,
+    future_len: int,
+) -> int:
+    """rollout 전체에서 step_start 슬라이싱이 가능하도록 noise bank 길이를 정합니다.
+
+    목적
+    ----
+    rollout은 step_start가 0부터 scenario_finish_step-1까지 진행될 수 있고,
+    매 step에서 길이 future_len 만큼 노이즈를 잘라서 씁니다.
+
+    그래서 최소 조건은:
+        bank_len >= scenario_finish_step + future_len
+
+    Args:
+        scenario_finish_step (int): rollout이 진행되는 최대 step 길이. shape: ()
+        future_len (int): 매번 예측하는 미래 길이 T. shape: ()
+
+    Returns:
+        int: noise bank 길이 L. shape: ()
+    """
+    s = int(max(0, int(scenario_finish_step)))
+    t = int(max(1, int(future_len)))
+    return int(s + t)
+
+
+def _get_or_build_inference_noise_bank_for_candidate(
+    *,
+    bank_cache: Dict[int, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    one_or_pnn: int,
+    bank_len: int,
+    rollout_idx: int,
+    base_seed: int,
+    ddp_rank: int,
+    pose_based: bool,
+    noise_std: float,
+    seed_stride: int,
+    cand_idx: int,
+) -> torch.Tensor:
+    """특정 cand_idx에 대한 noise bank를 캐시에서 가져오거나, 없으면 새로 만듭니다.
+
+    핵심
+    ----
+    - bank는 "step과 무관"하게 1번만 만들기 위해, seed에는 step_idx를 넣지 않습니다.
+      (구현에서는 step_idx=0으로 고정해서 만듭니다.)
+    - cand_idx마다 다른 bank가 나오도록, base_seed에 cand_idx*seed_stride를 섞습니다.
+    - bank shape:
+        pose_based=True  -> (B, 1+Pnn, bank_len, 4)
+        pose_based=False -> (B, 1+Pnn, bank_len, 3)
+
+    Args:
+        bank_cache (Dict[int, torch.Tensor]): cand_idx -> bank 텐서 캐시. shape: ()
+        device (torch.device): bank를 둘 device. shape: ()
+        dtype (torch.dtype): bank dtype. shape: ()
+        batch_size (int): B. shape: ()
+        one_or_pnn (int): (1+Pnn). shape: ()
+        bank_len (int): bank 길이 L. shape: ()
+        rollout_idx (int): rollout 인덱스. shape: ()
+        base_seed (int): 기본 seed. shape: ()
+        ddp_rank (int): DDP rank. shape: ()
+        pose_based (bool): pose 기반 여부(노이즈 마지막 차원 결정). shape: ()
+        noise_std (float): 노이즈 표준편차(기존 fine_tune_temperature와 동일). shape: ()
+        seed_stride (int): cand_idx별 seed 간격. shape: ()
+        cand_idx (int): 후보 인덱스. shape: ()
+
+    Returns:
+        torch.Tensor: noise bank 텐서. shape: (B, 1+Pnn, bank_len, 4 or 3)
+    """
+    c_idx = int(cand_idx)
+    last_dim = 4 if bool(pose_based) else 3
+
+    expected_shape = (
+        int(batch_size),
+        int(one_or_pnn),
+        int(bank_len),
+        int(last_dim),
+    )
+
+    cached = bank_cache.get(c_idx, None)
+    if isinstance(cached, torch.Tensor):
+        if tuple(int(x) for x in cached.shape) == expected_shape:
+            # device/dtype만 맞추면 재사용 가능
+            if cached.device != device or cached.dtype != dtype:
+                cached = cached.to(device=device, dtype=dtype)
+                bank_cache[c_idx] = cached
+            return cached
+
+    # cand_idx를 seed에 섞어서 후보마다 다른 bank를 만들기
+    cand_base_seed = int(base_seed) + int(c_idx) * int(seed_stride)
+
+    # ✅ step_idx를 0으로 고정해서 "rollout 전체에서 공유되는 긴 bank"를 1번 생성
+    bank = _build_inference_noise_for_rollout_chunk(
+        device=device,
+        dtype=dtype,
+        batch_size=int(batch_size),
+        one_or_pnn=int(one_or_pnn),
+        future_len=int(bank_len),          # ✅ 긴 길이
+        rollout_idx=int(rollout_idx),
+        base_seed=int(cand_base_seed),
+        ddp_rank=int(ddp_rank),
+        step_idx=0,                        # ✅ step seed 제거(고정)
+        pose_based=bool(pose_based),
+        noise_std=float(noise_std),
+    )
+
+    bank_cache[c_idx] = bank
+    return bank
+
+
+def _build_inference_noise_flat_from_bank_for_candidate_range(
+    *,
+    bank_cache: Dict[int, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    one_or_pnn: int,
+    future_len: int,
+    bank_len: int,
+    rollout_idx: int,
+    base_seed: int,
+    ddp_rank: int,
+    step_idx: int,
+    pose_based: bool,
+    noise_std: float,
+    seed_stride: int,
+    cand_start_idx: int,
+    cand_count: int,
+) -> torch.Tensor:
+    """noise bank에서 step_idx 위치로 잘라 후보 묶음의 inference_noise_flat을 만듭니다.
+
+    Args:
+        bank_cache (Dict[int, torch.Tensor]): cand_idx -> bank 캐시. shape: ()
+        device/dtype: model 입력과 맞출 값. shape: ()
+        batch_size (int): B. shape: ()
+        one_or_pnn (int): (1+Pnn). shape: ()
+        future_len (int): 매 step에서 필요한 길이 T. shape: ()
+        bank_len (int): bank 길이 L. shape: ()
+        rollout_idx/base_seed/ddp_rank/seed_stride/cand_*: bank 생성용. shape: ()
+        step_idx (int): 현재 step_start(슬라이스 시작점). shape: ()
+        pose_based (bool): last_dim 결정. shape: ()
+        noise_std (float): 노이즈 크기. shape: ()
+
+    Returns:
+        torch.Tensor:
+            inference_noise_flat
+            shape:
+              - pose_based=True  -> (B*cand_count, 1+Pnn, future_len, 4)
+              - pose_based=False -> (B*cand_count, 1+Pnn, future_len, 3)
+    """
+    b = int(max(1, int(batch_size)))
+    c = int(max(1, int(cand_count)))
+    t = int(max(1, int(future_len)))
+    s = int(max(0, int(step_idx)))
+    L = int(max(1, int(bank_len)))
+
+    if s + t > L:
+        raise ValueError(
+            "noise bank 길이가 부족합니다. "
+            f"step_idx={s}, future_len={t}, bank_len={L}. "
+            "bank_len은 최소 scenario_finish_step + future_len 이어야 합니다."
+        )
+
+    last_dim = 4 if bool(pose_based) else 3
+
+    noises = []
+    for local_i in range(c):
+        cand_idx = int(cand_start_idx) + int(local_i)
+        bank = _get_or_build_inference_noise_bank_for_candidate(
+            bank_cache=bank_cache,
+            device=device,
+            dtype=dtype,
+            batch_size=b,
+            one_or_pnn=int(one_or_pnn),
+            bank_len=L,
+            rollout_idx=int(rollout_idx),
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
+            pose_based=bool(pose_based),
+            noise_std=float(noise_std),
+            seed_stride=int(seed_stride),
+            cand_idx=int(cand_idx),
+        )
+        # slice: (B, 1+Pnn, future_len, last_dim)
+        noises.append(bank[:, :, s:s + t, :])
+
+    # (cand_count, B, 1+Pnn, future_len, last_dim)
+    noise_stack = torch.stack(noises, dim=0)
+
+    # (cand_count*B, 1+Pnn, future_len, last_dim)
+    noise_flat = noise_stack.reshape(
+        int(c) * int(b),
+        int(one_or_pnn),
+        int(t),
+        int(last_dim),
+    )
+    return noise_flat.contiguous()
+
 def _build_inference_noise_batch_for_candidate_range(
     *,
     device: torch.device,
@@ -3566,6 +3778,8 @@ def _build_inference_noise_batch_for_candidate_range(
     return noise_flat
 
 
+
+
 def _forward_and_score_candidate_batch(
     *,
     args: Any,
@@ -3586,66 +3800,84 @@ def _forward_and_score_candidate_batch(
     cand_count: int,
     seed_stride: int,
     gap: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # # key: cand_idx(0..K-1), value: (B, 1+Pnn, bank_len, 4 or 3)
+    inference_noise_bank_cache: Optional[Dict[int, torch.Tensor]] = None,
+    inference_noise_bank_len: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """후보 cand_count개를 한 번에 모델에 넣고, 거리 점수까지 계산합니다.
 
     변경점(핵심)
     ----------
-    - amortized + step_idx>0 에서 Decoder가 내부에서 randn_like로 랜덤을 만들지 않도록,
-      "amortized_random_noise"를 cand_idx 기반 seed로 만들어 inputs로 전달합니다.
-    - 이로써 후보의 랜덤이 GPU RNG 상태가 아니라 cand_idx/seed로 고정됩니다.
+    - (use_amortized_diffusion=False 기준)
+      rollout마다 cand_idx별로 만든 긴 noise bank를,
+      step_idx(step_start) 위치에서 잘라 inference_noise로 넣습니다.
+      그래서 gap < future_len일 때 겹치는 미래 구간이 같은 노이즈를 공유합니다.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            (cand_traj, cand_dist)
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+            (cand_traj, cand_dist, cand_control_seq)
             - cand_traj: (cand_count, B, 1+Pnn, 1+future_len, 4)
             - cand_dist: (cand_count, B, 1+Pnn)
-            - target_future_control_seq: (cand_count, B, (1+)Pnn, future_len, 3) or None
+            - cand_control_seq:
+                pose_based=True  -> None
+                pose_based=False -> (cand_count, B, 1+Pnn, future_len, 3)
     """
     rollout_repeat = int(max(1, int(cand_count)))
     b = int(max(1, int(batch_size)))
 
+    # 이 스크립트는 위에서 강제로 False로 만들고 있으므로,
+    # 실제론 거의 항상 False입니다.
     use_amortized = bool(getattr(args, "use_amortized_diffusion", False))
 
     reference_tensor = norm_inputs_step["ego_agent_past"]
     device = reference_tensor.device
     dtype = reference_tensor.dtype
 
+    pose_based_flag = bool(getattr(args, "pose_based", True))
+    noise_std_for_inference = float(getattr(args, "fine_tune_temperature", 0.5))
+
     # ------------------------------------------------------------
-    # (1) 후보별 노이즈 준비
-    #   - inference_noise: step_idx==0(또는 non-amortized)에서 쓰는 "초기 xT 노이즈"
-    #   - amortized_random_noise: amortized + step_idx>0에서 쓰는 "이전 버퍼에 섞을 랜덤"
-    #     (Decoder 내부 randn_like를 대체)
+    # (1) 후보별 inference_noise 준비
     # ------------------------------------------------------------
     inference_noise_flat: Optional[torch.Tensor] = None
     amortized_random_noise_flat: Optional[torch.Tensor] = None
 
-    need_initial_inference_noise = (not use_amortized) or (use_amortized and
-                                                           int(step_idx) == 0)
+    need_initial_inference_noise = (not use_amortized) or (use_amortized and int(step_idx) == 0)
     need_amortized_random_noise = use_amortized
-    pose_based_flag = bool(getattr(args, "pose_based", True))
+
     if need_initial_inference_noise:
-        # inference_noise_flat: (B*rollout_repeat, 1+Pnn, future_len, 4 or 3)
-        inference_noise_flat = _build_inference_noise_batch_for_candidate_range(
-            device=device,
-            dtype=dtype,
-            batch_size=b,
-            one_or_pnn=int(one_or_pnn),
-            future_len=int(future_len),
-            rollout_idx=int(rollout_idx),
-            base_seed=int(base_seed),
-            ddp_rank=int(ddp_rank),
-            step_idx=int(step_idx),
-            pose_based=pose_based_flag,
-            noise_std=float(getattr(args, "fine_tune_temperature", 0.5)),
-            seed_stride=int(seed_stride),
-            cand_start_idx=int(cand_start_idx),
-            cand_count=int(rollout_repeat),
+        # ✅ noise bank가 준비되어 있으면 bank에서 슬라이스해서 사용
+        use_noise_bank = (
+            (not use_amortized)
+            and isinstance(inference_noise_bank_cache, dict)
+            and isinstance(inference_noise_bank_len, int)
+            and int(inference_noise_bank_len) > 0
         )
 
+        if use_noise_bank:
+            inference_noise_flat = _build_inference_noise_flat_from_bank_for_candidate_range(
+                bank_cache=inference_noise_bank_cache,
+                device=device,
+                dtype=dtype,
+                batch_size=b,
+                one_or_pnn=int(one_or_pnn),
+                future_len=int(future_len),
+                bank_len=int(inference_noise_bank_len),
+                rollout_idx=int(rollout_idx),
+                base_seed=int(base_seed),
+                ddp_rank=int(ddp_rank),
+                step_idx=int(step_idx),                 # ✅ slice 시작점
+                pose_based=bool(pose_based_flag),
+                noise_std=float(noise_std_for_inference),
+                seed_stride=int(seed_stride),
+                cand_start_idx=int(cand_start_idx),
+                cand_count=int(rollout_repeat),
+            )
+        else:
+            raise ValueError("inference_noise_bank_cache is required when use_amortized_diffusion=True")
+
     if need_amortized_random_noise:
-        # ✅ Decoder의 기존 torch.randn_like(...)와 같은 분포를 맞추기 위해 noise_std=1.0 사용
-        # amortized_random_noise_flat: (B*rollout_repeat, 1+Pnn, future_len, 4)
+        # (현재 질문 범위에서는 use_amortized_diffusion=False라서 보통 실행되지 않음)
         amortized_random_noise_flat = _build_inference_noise_batch_for_candidate_range(
             device=device,
             dtype=dtype,
@@ -3656,7 +3888,7 @@ def _forward_and_score_candidate_batch(
             base_seed=int(base_seed),
             ddp_rank=int(ddp_rank),
             step_idx=int(step_idx),
-            pose_based=pose_based_flag,
+            pose_based=bool(pose_based_flag),
             noise_std=1.0,
             seed_stride=int(seed_stride),
             cand_start_idx=int(cand_start_idx),
@@ -3684,33 +3916,29 @@ def _forward_and_score_candidate_batch(
         batch_size=int(b),
     )
 
-    # ✅ Decoder가 읽는 키들
+    # Decoder가 읽는 키들
     norm_br_inputs_step["inference_noise"] = inference_noise_flat
     norm_br_inputs_step["amortized_random_noise"] = amortized_random_noise_flat
 
-    # (3) 모델 forward (한 번)
+    # (3) 모델 forward
     decoder_output = _forward_model_for_validation(
         args=args,
         model=model,
         norm_inputs=norm_br_inputs_step,
     )
 
-    cand_traj_flat = decoder_output[
-        "integrated_trajectory"]  # (B*R, 1+Pnn, 1+T, 4)
-    if args.pose_based:
+    cand_traj_flat = decoder_output["integrated_trajectory"]  # (B*R, 1+Pnn, 1+T, 4)
+
+    if bool(getattr(args, "pose_based", True)):
         target_future_control_seq = None
     else:
-        # (B*R, (1+)Pnn, T, 3)
-        # ✅ 우선: Feasible가 최종으로 사용한 control
-        target_future_control_seq = decoder_output.get(
-            "control_sequence", None)
-
-        # fallback: 구버전/예외 상황에서는 기존 score 사용
+        target_future_control_seq = decoder_output.get("control_sequence", None)
         if not isinstance(target_future_control_seq, torch.Tensor):
-            raise KeyError("Decoder 출력에 'control_sequence' 키가 없거나 텐서가 아닙니다. "
-                           "rollout_time_chunk_size > 1이면서 pose_based=False인 경우, "
-                           "모델이 'control_sequence'를 출력하도록 해야 합니다.")
-
+            raise KeyError(
+                "Decoder 출력에 'control_sequence' 키가 없거나 텐서가 아닙니다. "
+                "rollout_time_chunk_size > 1이면서 pose_based=False인 경우, "
+                "모델이 'control_sequence'를 출력하도록 해야 합니다."
+            )
 
     cand_traj = cand_traj_flat.reshape(
         int(rollout_repeat),
@@ -3719,14 +3947,18 @@ def _forward_and_score_candidate_batch(
         1 + int(future_len),
         4,
     )
-    # target_future_control_seq: (B*R, (1+)Pnn, T, 3) or None -> (R, B, (1+)Pnn, T, 3)
-    target_future_control_seq = target_future_control_seq.reshape(
-        int(rollout_repeat),
-        int(b),
-        int(one_or_pnn),
-        int(future_len),
-        -1,
-    ) if target_future_control_seq is not None else None
+
+    target_future_control_seq = (
+        target_future_control_seq.reshape(
+            int(rollout_repeat),
+            int(b),
+            int(one_or_pnn),
+            int(future_len),
+            -1,
+        )
+        if target_future_control_seq is not None
+        else None
+    )
 
     # len_rep/wid_rep: (B*R, 1+Pnn)
     len_rep = unnorm_agent_length_m.repeat(int(rollout_repeat), 1)
@@ -3743,11 +3975,9 @@ def _forward_and_score_candidate_batch(
         unnorm_agent_width_m=wid_rep,
     )
 
-    cand_dist = cand_dist_flat.reshape(int(rollout_repeat), int(b),
-                                       int(one_or_pnn))
+    cand_dist = cand_dist_flat.reshape(int(rollout_repeat), int(b), int(one_or_pnn))
 
     return cand_traj, cand_dist, target_future_control_seq
-
 
 def _compute_candidate_score_mean_over_valid_agents(
         *,
@@ -4025,6 +4255,8 @@ import torch
 import torch.nn as nn
 
 
+
+
 def _select_best_trajectory_by_sample_k(
     *,
     args: Any,
@@ -4042,27 +4274,13 @@ def _select_best_trajectory_by_sample_k(
     ddp_rank: int,
     step_idx: int,
     gap: int,
+    # ✅ 추가: noise bank
+    inference_noise_bank_cache: Optional[Dict[int, torch.Tensor]] = None,
+    inference_noise_bank_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """같은 입력에서 후보 K개를 만들고, 규칙에 따라 최종 1개를 고릅니다.
-
-    변경점(핵심)
-    ----------
-    - best traj를 고른 후보 인덱스(idx)를 그대로 써서,
-      (pose_based=False인 경우) best control_seq도 같은 후보에서 함께 뽑습니다.
-    - pose_based=True면 control_seq는 None을 유지합니다.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-            (best_normed_traj, best_distance_m_per_agent, best_control_seq)
-            - best_normed_traj: (B, 1+Pnn, 1+future_len, 4)
-            - best_distance_m_per_agent: (B, 1+Pnn)
-            - best_control_seq:
-                - pose_based=True  -> None
-                - pose_based=False -> (B, 1+Pnn, future_len, C)  (보통 C=3)
-    """
+    """같은 입력에서 후보 K개를 만들고, 규칙에 따라 최종 1개를 고릅니다."""
     select_jointly: bool = bool(getattr(args, "select_jointly", False))
 
-    # K(후보 개수)
     fine_tune_gen_k_raw = getattr(args, "fine_tune_gen_k", 1)
     try:
         fine_tune_gen_k = int(fine_tune_gen_k_raw)
@@ -4073,30 +4291,29 @@ def _select_best_trajectory_by_sample_k(
     seed_stride = 10_000_000
 
     try:
-        # cand_traj_batch: (K, B, 1+Pnn, 1+future_len, 4)
-        # cand_dist_batch: (K, B, 1+Pnn)
-        # target_future_control_seq: (K, B, 1+Pnn, future_len, C) or None
-        (cand_traj_batch, cand_dist_batch,
-         target_future_control_seq) = _forward_and_score_candidate_batch(
-             args=args,
-             model=model,
-             norm_inputs_step=norm_inputs_step,
-             state_normalizer=state_normalizer,
-             unnorm_outputs_copy=unnorm_outputs_copy,
-             unnorm_agent_length_m=unnorm_agent_length_m,
-             unnorm_agent_width_m=unnorm_agent_width_m,
-             batch_size=int(batch_size),
-             one_or_pnn=int(one_or_pnn),
-             future_len=int(future_len),
-             rollout_idx=int(rollout_idx),
-             base_seed=int(base_seed),
-             ddp_rank=int(ddp_rank),
-             step_idx=int(step_idx),
-             cand_start_idx=0,
-             cand_count=int(fine_tune_gen_k),
-             seed_stride=int(seed_stride),
-             gap=int(gap),
-         )
+        (cand_traj_batch, cand_dist_batch, target_future_control_seq) = _forward_and_score_candidate_batch(
+            args=args,
+            model=model,
+            norm_inputs_step=norm_inputs_step,
+            state_normalizer=state_normalizer,
+            unnorm_outputs_copy=unnorm_outputs_copy,
+            unnorm_agent_length_m=unnorm_agent_length_m,
+            unnorm_agent_width_m=unnorm_agent_width_m,
+            batch_size=int(batch_size),
+            one_or_pnn=int(one_or_pnn),
+            future_len=int(future_len),
+            rollout_idx=int(rollout_idx),
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
+            step_idx=int(step_idx),
+            cand_start_idx=0,
+            cand_count=int(fine_tune_gen_k),
+            seed_stride=int(seed_stride),
+            gap=int(gap),
+            # ✅ noise bank 전달
+            inference_noise_bank_cache=inference_noise_bank_cache,
+            inference_noise_bank_len=inference_noise_bank_len,
+        )
     except BaseException as e:
         if _is_gpu_oom_error(e):
             _clear_gpu_cache_after_oom()
@@ -4110,7 +4327,6 @@ def _select_best_trajectory_by_sample_k(
     best_control_seq: Optional[torch.Tensor] = None
 
     if select_jointly:
-        # (B, 1+Pnn)
         target_agent_current_is_valid = _build_target_agent_current_is_valid_mask(
             norm_inputs_step=norm_inputs_step,
         )
@@ -4119,22 +4335,21 @@ def _select_best_trajectory_by_sample_k(
             best_dist=None,
             best_score=None,
             best_control_seq=None,
-            cand_traj=cand_traj_batch,  # (K, B, 1+Pnn, 1+future_len, 4)
-            cand_dist=cand_dist_batch,  # (K, B, 1+Pnn)
-            cand_control_seq=target_future_control_seq,  # (K, B, 1+Pnn, future_len, C) or None
-            agent_current_is_valid=target_agent_current_is_valid,  # (B, 1+Pnn)
+            cand_traj=cand_traj_batch,
+            cand_dist=cand_dist_batch,
+            cand_control_seq=target_future_control_seq,
+            agent_current_is_valid=target_agent_current_is_valid,
         )
     else:
         best_traj, best_dist, best_control_seq = _select_best_from_candidate_batch_per_agent(
             best_traj=None,
             best_dist=None,
             best_control_seq=None,
-            cand_traj=cand_traj_batch,  # (K, B, 1+Pnn, 1+future_len, 4)
-            cand_dist=cand_dist_batch,  # (K, B, 1+Pnn)
-            cand_control_seq=target_future_control_seq,  # (K, B, 1+Pnn, future_len, C) or None
+            cand_traj=cand_traj_batch,
+            cand_dist=cand_dist_batch,
+            cand_control_seq=target_future_control_seq,
         )
 
-    # (메모리 압박 완화)
     del cand_traj_batch
     del cand_dist_batch
     del target_future_control_seq

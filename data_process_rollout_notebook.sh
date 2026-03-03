@@ -163,14 +163,14 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
- finetune_data_maker_custom.py \
+ finetune_data_maker.py \
  --port 23001 \
   --eval_set "$EVAL_SET_PATH" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
-  --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
+  --load_name "w_integ_loss_thres_1_p_sat_0.25" \
+  --name "w_integ_loss_thres_1_p_sat_0.25" \
   --eval_method "fine_tune_data_maker" \
   --batch_size 1 \
   --pose_based False \
@@ -183,7 +183,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_deepspeed True \
   --save_image False \
   --save_video False \
-  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0226" \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0303" \
   --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
