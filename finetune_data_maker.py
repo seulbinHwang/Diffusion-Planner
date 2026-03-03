@@ -54,6 +54,7 @@ from typing import Any, Dict, List
 
 import torch
 from numpy.typing import NDArray
+
 ArrayF = NDArray[np.floating]
 
 _INFERENCE_NPZ_EXCLUDED_EXACT_KEYS: Set[str] = {
@@ -85,7 +86,8 @@ import os
 import torch.nn as nn
 
 
-def _force_disable_amortized_diffusion_for_finetune_data_maker(args: Any) -> None:
+def _force_disable_amortized_diffusion_for_finetune_data_maker(
+        args: Any) -> None:
     """이 스크립트에서 use_amortized_diffusion을 항상 False로 강제합니다.
 
     이유:
@@ -110,10 +112,8 @@ def _force_disable_amortized_diffusion_for_finetune_data_maker(args: Any) -> Non
         except Exception:
             rank = 0
         if rank == 0:
-            print(
-                "[finetune_data_maker] use_amortized_diffusion=True 설정이 감지되어 "
-                "안전을 위해 False로 강제합니다."
-            )
+            print("[finetune_data_maker] use_amortized_diffusion=True 설정이 감지되어 "
+                  "안전을 위해 False로 강제합니다.")
 
 
 def _force_disable_amortized_diffusion_in_model(model: nn.Module) -> None:
@@ -155,6 +155,7 @@ def _force_disable_amortized_diffusion_in_model(model: nn.Module) -> None:
                 setattr(cfg, "use_amortized_diffusion", False)
             except Exception:
                 pass
+
 
 def _clone_nested_value_for_rollout(
     value: Any,
@@ -1490,13 +1491,13 @@ def _maybe_draw_rollout_visualization_frame(
     # _prepare_data_for_one_batch_draw 내부에서:
     # - (B)에서 state.draw_batch_idx 샘플 1개만 뽑아 numpy로 만듭니다.
     (a_unnorm_inputs_np, a_unnorm_selected_gt_traj_np,
-     a_unnorm_near_future_gt_3_dim, a_unnorm_ego_future_gt_4_dim
-    ) = _prepare_data_for_one_batch_draw(
-        unnorm_inputs_copy=unnorm_inputs_copy,
-        unnorm_outputs_copy=unnorm_outputs_copy,
-        unnorm_selected_gt_traj=unnorm_selected_gt_traj,  # (B, 1+Pnn, 1+T, 4)
-        draw_batch_idx=int(state.draw_batch_idx),
-    )
+     a_unnorm_near_future_gt_3_dim,
+     a_unnorm_ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
+         unnorm_inputs_copy=unnorm_inputs_copy,
+         unnorm_outputs_copy=unnorm_outputs_copy,
+         unnorm_selected_gt_traj=unnorm_selected_gt_traj,  # (B, 1+Pnn, 1+T, 4)
+         draw_batch_idx=int(state.draw_batch_idx),
+     )
 
     _draw_one_batch_one_rollout(
         save_dir=str(state.save_dir),
@@ -1838,18 +1839,17 @@ def _remove_invalid_data(
     neighbor_agents_past = npz_payload_dict.get("neighbor_agents_past", None)
     if neighbor_agents_past is not None:
         assert neighbor_agents_is_valid is not None, (
-            "neighbor_agents_is_valid가 None인데 neighbor_agents_past가 존재합니다."
-        )
+            "neighbor_agents_is_valid가 None인데 neighbor_agents_past가 존재합니다.")
         neighbor_agents_is_valid = neighbor_agents_is_valid.astype(bool)
         npz_payload_dict["neighbor_agents_past"] = npz_payload_dict[
-            "neighbor_agents_past"
-        ][neighbor_agents_is_valid]  # (valid_chosen_agent_num, time_len, 11)
+            "neighbor_agents_past"][
+                neighbor_agents_is_valid]  # (valid_chosen_agent_num, time_len, 11)
         npz_payload_dict["neighbor_future_gt_3_dim"] = npz_payload_dict[
-            "neighbor_future_gt_3_dim"
-        ][neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 3)
+            "neighbor_future_gt_3_dim"][
+                neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 3)
         npz_payload_dict["neighbor_future_gt_11_dim"] = npz_payload_dict[
-            "neighbor_future_gt_11_dim"
-        ][neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 11)
+            "neighbor_future_gt_11_dim"][
+                neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 11)
 
     # ------------------------------------------------------------
     # ✅ (추가) future_seg_control_gt_3_dim: (1+Pnn, future_len, 3)
@@ -1857,31 +1857,29 @@ def _remove_invalid_data(
     # - neighbor(1..Pnn)는 neighbor_agents_is_valid 로 필터링
     # ✅ (추가) past_seg_control_gt_3_dim 도 동일한 full_mask로 같이 필터링
     # ------------------------------------------------------------
-    future_seg_control_gt_3_dim = npz_payload_dict.get("future_seg_control_gt_3_dim", None)
+    future_seg_control_gt_3_dim = npz_payload_dict.get(
+        "future_seg_control_gt_3_dim", None)
     if future_seg_control_gt_3_dim is not None:
         if not isinstance(future_seg_control_gt_3_dim, np.ndarray):
-            raise TypeError(
-                "future_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
-                f"type={type(future_seg_control_gt_3_dim)}"
-            )
-        if future_seg_control_gt_3_dim.ndim != 3 or int(future_seg_control_gt_3_dim.shape[-1]) != 3:
+            raise TypeError("future_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
+                            f"type={type(future_seg_control_gt_3_dim)}")
+        if future_seg_control_gt_3_dim.ndim != 3 or int(
+                future_seg_control_gt_3_dim.shape[-1]) != 3:
             raise ValueError(
                 "future_seg_control_gt_3_dim은 (1+Pnn, future_len, 3)이어야 합니다. "
-                f"got shape={tuple(future_seg_control_gt_3_dim.shape)}"
-            )
+                f"got shape={tuple(future_seg_control_gt_3_dim.shape)}")
 
         agent_count = int(future_seg_control_gt_3_dim.shape[0])  # 1+Pnn
         pnn = int(max(0, agent_count - 1))
 
         if pnn == 0:
             # ego만 있는 경우: 그대로 둠
-            npz_payload_dict["future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim
+            npz_payload_dict[
+                "future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim
         else:
             if neighbor_agents_is_valid is None:
-                raise ValueError(
-                    "future_seg_control_gt_3_dim에 neighbor가 있는데 "
-                    "neighbor_agents_is_valid가 None입니다."
-                )
+                raise ValueError("future_seg_control_gt_3_dim에 neighbor가 있는데 "
+                                 "neighbor_agents_is_valid가 None입니다.")
 
             neighbor_mask = np.asarray(neighbor_agents_is_valid).astype(bool)
             if neighbor_mask.ndim != 1:
@@ -1891,52 +1889,57 @@ def _remove_invalid_data(
                 raise ValueError(
                     "neighbor_agents_is_valid 길이와 future_seg_control_gt_3_dim의 Pnn이 다릅니다. "
                     f"len(mask)={int(neighbor_mask.shape[0])}, Pnn={int(pnn)}, "
-                    f"control_shape={tuple(future_seg_control_gt_3_dim.shape)}"
-                )
+                    f"control_shape={tuple(future_seg_control_gt_3_dim.shape)}")
 
             # ego는 항상 True
-            full_mask = np.concatenate([np.array([True], dtype=bool), neighbor_mask], axis=0)  # (1+Pnn,)
+            full_mask = np.concatenate(
+                [np.array([True], dtype=bool), neighbor_mask],
+                axis=0)  # (1+Pnn,)
 
             # (1+valid_neighbor_num, future_len, 3)
-            npz_payload_dict["future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim[full_mask]
+            npz_payload_dict[
+                "future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim[
+                    full_mask]
 
             # ------------------------------------------------------------
             # ✅ (핵심) past_seg_control_gt_3_dim도 같은 full_mask로 필터링
             # 기대 shape: (1+Pnn, past_len, 3)
             # ------------------------------------------------------------
-            past_seg_control_gt_3_dim = npz_payload_dict.get("past_seg_control_gt_3_dim", None)
+            past_seg_control_gt_3_dim = npz_payload_dict.get(
+                "past_seg_control_gt_3_dim", None)
             if past_seg_control_gt_3_dim is not None:
                 if not isinstance(past_seg_control_gt_3_dim, np.ndarray):
                     raise TypeError(
                         "past_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
-                        f"type={type(past_seg_control_gt_3_dim)}"
-                    )
-                if past_seg_control_gt_3_dim.ndim != 3 or int(past_seg_control_gt_3_dim.shape[-1]) != 3:
+                        f"type={type(past_seg_control_gt_3_dim)}")
+                if past_seg_control_gt_3_dim.ndim != 3 or int(
+                        past_seg_control_gt_3_dim.shape[-1]) != 3:
                     raise ValueError(
                         "past_seg_control_gt_3_dim은 (1+Pnn, past_len, 3)이어야 합니다. "
-                        f"got shape={tuple(past_seg_control_gt_3_dim.shape)}"
-                    )
+                        f"got shape={tuple(past_seg_control_gt_3_dim.shape)}")
                 if int(past_seg_control_gt_3_dim.shape[0]) != int(agent_count):
                     raise ValueError(
                         "past_seg_control_gt_3_dim의 agent 축(첫 차원)이 "
                         "future_seg_control_gt_3_dim과 일치해야 합니다. "
                         f"past_agent_count={int(past_seg_control_gt_3_dim.shape[0])}, "
-                        f"future_agent_count={int(agent_count)}"
-                    )
+                        f"future_agent_count={int(agent_count)}")
 
                 # (1+valid_neighbor_num, past_len, 3)
-                npz_payload_dict["past_seg_control_gt_3_dim"] = past_seg_control_gt_3_dim[full_mask]
+                npz_payload_dict[
+                    "past_seg_control_gt_3_dim"] = past_seg_control_gt_3_dim[
+                        full_mask]
 
     # --- 이하 기존 코드 그대로 ---
     lanes = npz_payload_dict["lanes"]  # (chosen_lane_num, lane_len, 12)
     if lanes is not None:
         assert lanes_is_valid is not None, (
-            "lanes_is_valid가 None인데 lanes가 존재합니다."
-        )
+            "lanes_is_valid가 None인데 lanes가 존재합니다.")
         lanes_is_valid = lanes_is_valid.astype(bool)
         npz_payload_dict["lanes"] = lanes[lanes_is_valid]
-        npz_payload_dict["lanes_speed_limit"] = npz_payload_dict["lanes_speed_limit"][lanes_is_valid]
-        npz_payload_dict["lanes_has_speed_limit"] = npz_payload_dict["lanes_has_speed_limit"][lanes_is_valid]
+        npz_payload_dict["lanes_speed_limit"] = npz_payload_dict[
+            "lanes_speed_limit"][lanes_is_valid]
+        npz_payload_dict["lanes_has_speed_limit"] = npz_payload_dict[
+            "lanes_has_speed_limit"][lanes_is_valid]
 
         lane_type = npz_payload_dict.get("lane_type", None)
         left_line_type = npz_payload_dict.get("left_line_type", None)
@@ -1944,77 +1947,78 @@ def _remove_invalid_data(
         if lane_type is not None:
             npz_payload_dict["lane_type"] = lane_type[lanes_is_valid]
         if left_line_type is not None:
-            npz_payload_dict["left_line_type"] = npz_payload_dict["left_line_type"][lanes_is_valid]
+            npz_payload_dict["left_line_type"] = npz_payload_dict[
+                "left_line_type"][lanes_is_valid]
         if right_line_type is not None:
-            npz_payload_dict["right_line_type"] = npz_payload_dict["right_line_type"][lanes_is_valid]
+            npz_payload_dict["right_line_type"] = npz_payload_dict[
+                "right_line_type"][lanes_is_valid]
 
-    agent_route_lane_order = npz_payload_dict.get("agent_route_lane_order", None)
+    agent_route_lane_order = npz_payload_dict.get("agent_route_lane_order",
+                                                  None)
     if agent_route_lane_order is not None and neighbor_agents_past is not None and lanes is not None:
         npz_payload_dict["agent_route_lane_order"] = agent_route_lane_order[
-            neighbor_agents_is_valid
-        ][:, lanes_is_valid]
+            neighbor_agents_is_valid][:, lanes_is_valid]
 
     route_lanes = npz_payload_dict.get("route_lanes", None)
     if route_lanes is not None:
         assert route_lanes_is_valid is not None, (
-            "route_lanes_is_valid가 None인데 route_lanes가 존재합니다."
-        )
+            "route_lanes_is_valid가 None인데 route_lanes가 존재합니다.")
         route_lanes_is_valid = route_lanes_is_valid.astype(bool)
         npz_payload_dict["route_lanes"] = route_lanes[route_lanes_is_valid]
-        npz_payload_dict["route_lanes_speed_limit"] = npz_payload_dict["route_lanes_speed_limit"][route_lanes_is_valid]
-        npz_payload_dict["route_lanes_has_speed_limit"] = npz_payload_dict["route_lanes_has_speed_limit"][route_lanes_is_valid]
+        npz_payload_dict["route_lanes_speed_limit"] = npz_payload_dict[
+            "route_lanes_speed_limit"][route_lanes_is_valid]
+        npz_payload_dict["route_lanes_has_speed_limit"] = npz_payload_dict[
+            "route_lanes_has_speed_limit"][route_lanes_is_valid]
 
     stop_sign_points = npz_payload_dict.get("stop_sign_points", None)
     if stop_sign_points is not None:
         assert stop_sign_is_valid is not None, (
-            "stop_sign_points_is_valid가 None인데 stop_sign_points가 존재합니다."
-        )
+            "stop_sign_points_is_valid가 None인데 stop_sign_points가 존재합니다.")
         stop_sign_is_valid = stop_sign_is_valid.astype(bool)
-        npz_payload_dict["stop_sign_points"] = stop_sign_points[stop_sign_is_valid]
+        npz_payload_dict["stop_sign_points"] = stop_sign_points[
+            stop_sign_is_valid]
 
     speed_bump_points = npz_payload_dict.get("speed_bump_points", None)
     if speed_bump_points is not None:
         assert speed_bump_is_valid is not None, (
-            "speed_bump_points_is_valid가 None인데 speed_bump_points가 존재합니다."
-        )
+            "speed_bump_points_is_valid가 None인데 speed_bump_points가 존재합니다.")
         speed_bump_is_valid = speed_bump_is_valid.astype(bool)
-        npz_payload_dict["speed_bump_points"] = speed_bump_points[speed_bump_is_valid]
+        npz_payload_dict["speed_bump_points"] = speed_bump_points[
+            speed_bump_is_valid]
 
     crosswalk_points = npz_payload_dict.get("crosswalk_points", None)
     if crosswalk_points is not None:
         assert crosswalk_is_valid is not None, (
-            "crosswalk_points_is_valid가 None인데 crosswalk_points가 존재합니다."
-        )
+            "crosswalk_points_is_valid가 None인데 crosswalk_points가 존재합니다.")
         crosswalk_is_valid = crosswalk_is_valid.astype(bool)
-        npz_payload_dict["crosswalk_points"] = crosswalk_points[crosswalk_is_valid]
+        npz_payload_dict["crosswalk_points"] = crosswalk_points[
+            crosswalk_is_valid]
 
     driveway_points = npz_payload_dict.get("driveway_points", None)
     if driveway_points is not None:
         assert driveway_is_valid is not None, (
-            "driveway_points_is_valid가 None인데 driveway_points가 존재합니다."
-        )
+            "driveway_points_is_valid가 None인데 driveway_points가 존재합니다.")
         driveway_is_valid = driveway_is_valid.astype(bool)
         npz_payload_dict["driveway_points"] = driveway_points[driveway_is_valid]
 
     road_edge = npz_payload_dict.get("road_edge", None)
     if road_edge is not None:
         assert road_edge_is_valid is not None, (
-            "road_edge_is_valid가 None인데 road_edge가 존재합니다."
-        )
+            "road_edge_is_valid가 None인데 road_edge가 존재합니다.")
         road_edge_is_valid = road_edge_is_valid.astype(bool)
         npz_payload_dict["road_edge"] = road_edge[road_edge_is_valid]
-        npz_payload_dict["road_edge_type"] = npz_payload_dict["road_edge_type"][road_edge_is_valid]
+        npz_payload_dict["road_edge_type"] = npz_payload_dict["road_edge_type"][
+            road_edge_is_valid]
 
     static_objects = npz_payload_dict.get("static_objects", None)
     if static_objects is not None:
         assert static_objects_is_valid is not None, (
-            "static_objects_is_valid가 None인데 static_objects가 존재합니다."
-        )
+            "static_objects_is_valid가 None인데 static_objects가 존재합니다.")
         static_objects_is_valid = static_objects_is_valid.astype(bool)
-        npz_payload_dict["static_objects"] = static_objects[static_objects_is_valid]
+        npz_payload_dict["static_objects"] = static_objects[
+            static_objects_is_valid]
 
     return npz_payload_dict
-
 
 
 def _apply_unvalid_at_unnorm_selected_traj_raw(
@@ -2311,10 +2315,8 @@ def _compute_seg_control_from_pose4(
             shape: (B, 1+Pnn, T, 3)
     """
     if pose_4_dim.dim() != 4 or int(pose_4_dim.shape[-1]) != 4:
-        raise ValueError(
-            "pose_4_dim은 (B, 1+Pnn, 1+T, 4) 이어야 합니다. "
-            f"got shape={tuple(pose_4_dim.shape)}"
-        )
+        raise ValueError("pose_4_dim은 (B, 1+Pnn, 1+T, 4) 이어야 합니다. "
+                         f"got shape={tuple(pose_4_dim.shape)}")
 
     # (B, 1+Pnn, 1+T, 3)
     pose_3_dim = _traj11_to_traj3_heading(pose_4_dim)
@@ -2338,6 +2340,7 @@ def _compute_seg_control_from_pose4(
     # 무효 구간은 0으로
     ctrl = ctrl * seg_valid.unsqueeze(-1).to(dtype=ctrl.dtype)
     return ctrl
+
 
 def _predict_one_rollout_sequential(
     args: Any,
@@ -2424,35 +2427,34 @@ def _predict_one_rollout_sequential(
               - pose_based=False => (B, 1+Pnn, future_len, 3)
               - pose_based=True => None
             """
-            (best_normed_traj,
-             best_dist_m,
+            (best_normed_traj, best_dist_m,
              best_control_seq) = _select_best_trajectory_by_sample_k(
-                args=args,
-                model=model,
-                norm_inputs_step=norm_inputs_step,
-                state_normalizer=state_normalizer,
-                unnorm_outputs_copy=unnorm_outputs_copy,
-                unnorm_agent_length_m=unnorm_agent_length_m,
-                unnorm_agent_width_m=unnorm_agent_width_m,
-                batch_size=int(batch_size),
-                one_or_pnn=int(one_or_pnn),
-                future_len=int(future_len),
-                rollout_idx=int(rollout_idx),
-                base_seed=int(base_seed),
-                ddp_rank=int(ddp_rank),
-                step_idx=int(step_start),
-                gap=gap,
-                # ✅ (추가) noise bank 전달
-                inference_noise_bank_cache=inference_noise_bank_cache,
-                inference_noise_bank_len=int(inference_noise_bank_len),
-            )
+                 args=args,
+                 model=model,
+                 norm_inputs_step=norm_inputs_step,
+                 state_normalizer=state_normalizer,
+                 unnorm_outputs_copy=unnorm_outputs_copy,
+                 unnorm_agent_length_m=unnorm_agent_length_m,
+                 unnorm_agent_width_m=unnorm_agent_width_m,
+                 batch_size=int(batch_size),
+                 one_or_pnn=int(one_or_pnn),
+                 future_len=int(future_len),
+                 rollout_idx=int(rollout_idx),
+                 base_seed=int(base_seed),
+                 ddp_rank=int(ddp_rank),
+                 step_idx=int(step_start),
+                 gap=gap,
+                 # ✅ (추가) noise bank 전달
+                 inference_noise_bank_cache=inference_noise_bank_cache,
+                 inference_noise_bank_len=int(inference_noise_bank_len),
+             )
 
             # (B, 1+Pnn, future_len), (B, 1+Pnn, 1+future_len)
             (target_current_is_valid, target_future_gt_is_valid,
              target_cur_fut_gt_is_valid) = _build_target_cur_future_is_valid(
                  unnorm_inputs_copy=unnorm_inputs_copy,
                  unnorm_outputs_copy=unnorm_outputs_copy,
-            )
+             )
             # target_current_is_valid: (B, 1+Pnn) -> (B, 1+Pnn, 1) -> (B, 1+Pnn, 1+future_len)
             target_current_is_valid_expand = target_current_is_valid.unsqueeze(
                 2).expand(-1, -1, 1 + int(future_len))
@@ -2468,10 +2470,13 @@ def _predict_one_rollout_sequential(
                 # best_control_seq : (B, 1+Pnn, future_len, 3)
                 unnorm_best_control_seq = state_normalizer.inverse(
                     data=best_control_seq,
-                    valid_mask=target_current_is_valid_expand[:, :, 1:], # (B, 1+Pnn, future_len)
+                    valid_mask=
+                    target_current_is_valid_expand[:, :,
+                                                   1:],  # (B, 1+Pnn, future_len)
                 )
                 # unnorm_target_control_chunk: (B, 1+Pnn, gap, 3)
-                unnorm_target_control_chunk = unnorm_best_control_seq[:, :, :gap, :]
+                unnorm_target_control_chunk = unnorm_best_control_seq[:, :, :
+                                                                      gap, :]
 
             # unnorm_selected_traj_raw: (B, 1+Pnn, 1+future_len, 4)
             unnorm_selected_traj_raw = _apply_recovery_if_needed(
@@ -2517,7 +2522,7 @@ def _predict_one_rollout_sequential(
                 # future_seg_control_gt_3_dim: (B, (1+)Pnn, future_len, 3)
                 (ego_future_gt_4_dim, near_future_gt_4_dim,
                  future_seg_control_gt_3_dim
-                 ) = _build_generated_demo_futures_from_selected_traj(
+                ) = _build_generated_demo_futures_from_selected_traj(
                     unnorm_selected_gt_traj=unnorm_selected_gt_traj,
                     # (B, 1+Pnn, 1+future_len, 4)
                     target_cur_fut_gt_is_valid=target_cur_fut_gt_is_valid,
@@ -2571,7 +2576,8 @@ def _predict_one_rollout_sequential(
                     dt=float(0.1),  # 기존 저장 로직과 동일하게 0.1 사용
                 )  # (B, 1+Pnn, gap, 3)
 
-            unnorm_origin_pose_world = unnorm_inputs_copy["origin_world_pose"]  # (B, 4) (x,y,cos,sin)
+            unnorm_origin_pose_world = unnorm_inputs_copy[
+                "origin_world_pose"]  # (B, 4) (x,y,cos,sin)
 
             # unnorm_target_pose_chunk_world: (B, 1+Pnn, gap, 4)
             unnorm_target_pose_chunk_world = _convert_target_chunk_to_world(
@@ -2581,7 +2587,9 @@ def _predict_one_rollout_sequential(
             )
 
             # (B, 4) - ego의 마지막 월드 포즈로 갱신
-            unnorm_inputs_copy["origin_world_pose"] = unnorm_target_pose_chunk_world[:, 0, -1, :]
+            unnorm_inputs_copy[
+                "origin_world_pose"] = unnorm_target_pose_chunk_world[:, 0,
+                                                                      -1, :]
 
             # (B, gap, 4)
             unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:, 0, :, :]
@@ -2589,12 +2597,14 @@ def _predict_one_rollout_sequential(
             # (B, Pnn, gap, 4)
             unnorm_near_pose_chunk = unnorm_target_pose_chunk[:, 1:, :, :]
 
-            (unnorm_inputs_copy, unnorm_outputs_copy) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
+            (unnorm_inputs_copy, unnorm_outputs_copy
+            ) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
                 unnorm_inputs_copy=unnorm_inputs_copy,
                 unnorm_outputs_copy=unnorm_outputs_copy,
                 unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
                 unnorm_near_pose_chunk=unnorm_near_pose_chunk,
-                unnorm_target_control_chunk=unnorm_target_control_chunk,  # Optional[(B, 1+Pnn, gap, 3)]
+                unnorm_target_control_chunk=
+                unnorm_target_control_chunk,  # Optional[(B, 1+Pnn, gap, 3)]
                 cached_valid_masks=cached_valid_masks,
             )
 
@@ -2606,6 +2616,7 @@ def _predict_one_rollout_sequential(
         args=args,
         state=vis_state,
     )
+
 
 def _augment_inputs_with_future_seg_control_for_npz(
     a_inputs_dict: Dict[str, Any],
@@ -2632,15 +2643,12 @@ def _augment_inputs_with_future_seg_control_for_npz(
         return
 
     if not isinstance(ctrl, np.ndarray):
-        raise TypeError(
-            "future_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
-            f"type={type(ctrl)}"
-        )
+        raise TypeError("future_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
+                        f"type={type(ctrl)}")
     if ctrl.ndim != 3 or int(ctrl.shape[-1]) != 3:
         raise ValueError(
             "future_seg_control_gt_3_dim은 (1+Pnn, future_len, 3)이어야 합니다. "
-            f"got shape={tuple(ctrl.shape)}"
-        )
+            f"got shape={tuple(ctrl.shape)}")
 
     a_inputs_dict["future_seg_control_gt_3_dim"] = ctrl
 
@@ -2763,7 +2771,7 @@ def _augment_inputs_with_ego_futures_for_npz(
         None
     """
     ego_future_gt_is_valid_raw = a_outputs_dict.get("ego_future_gt_is_valid",
-                                                   None)
+                                                    None)
     if ego_future_gt_is_valid_raw is None:
         ego_future_gt_is_valid_raw = a_outputs_dict.get(
             "ego_future_gt_is_valid", None)
@@ -3539,7 +3547,6 @@ def _compute_inference_noise_bank_len(
     return int(s + t)
 
 
-
 def _get_or_build_inference_noise_bank_stack_for_candidate_range(
     *,
     bank_cache: Dict[int, torch.Tensor],
@@ -3604,7 +3611,8 @@ def _get_or_build_inference_noise_bank_stack_for_candidate_range(
     expected_stack_shape = (k, b, p, L, d)
 
     cached_stack = bank_cache.get(stack_key, None)
-    if isinstance(cached_stack, torch.Tensor) and tuple(int(x) for x in cached_stack.shape) == expected_stack_shape:
+    if isinstance(cached_stack, torch.Tensor) and tuple(
+            int(x) for x in cached_stack.shape) == expected_stack_shape:
         # device/dtype만 맞추고 반환
         if cached_stack.device != device or cached_stack.dtype != dtype:
             cached_stack = cached_stack.to(device=device, dtype=dtype)
@@ -3628,10 +3636,8 @@ def _get_or_build_inference_noise_bank_stack_for_candidate_range(
 
         # 이미 cand bank가 있으면 재사용(shape가 맞을 때만)
         existing = bank_cache.get(cand_idx, None)
-        use_existing = (
-            isinstance(existing, torch.Tensor)
-            and tuple(int(x) for x in existing.shape) == (b, p, L, d)
-        )
+        use_existing = (isinstance(existing, torch.Tensor) and
+                        tuple(int(x) for x in existing.shape) == (b, p, L, d))
 
         if use_existing:
             src = existing
@@ -3646,11 +3652,11 @@ def _get_or_build_inference_noise_bank_stack_for_candidate_range(
                 dtype=dtype,
                 batch_size=b,
                 one_or_pnn=p,
-                future_len=L,             # ✅ bank 길이
+                future_len=L,  # ✅ bank 길이
                 rollout_idx=int(rollout_idx),
                 base_seed=int(cand_base_seed),
                 ddp_rank=int(ddp_rank),
-                step_idx=0,               # ✅ step seed 제거
+                step_idx=0,  # ✅ step seed 제거
                 pose_based=bool(pose_based),
                 noise_std=float(noise_std),
             )
@@ -3661,6 +3667,7 @@ def _get_or_build_inference_noise_bank_stack_for_candidate_range(
 
     bank_cache[stack_key] = bank_stack
     return bank_stack
+
 
 def _get_or_build_inference_noise_bank_for_candidate(
     *,
@@ -3735,11 +3742,11 @@ def _get_or_build_inference_noise_bank_for_candidate(
         dtype=dtype,
         batch_size=int(batch_size),
         one_or_pnn=int(one_or_pnn),
-        future_len=int(bank_len),          # ✅ 긴 길이
+        future_len=int(bank_len),  # ✅ 긴 길이
         rollout_idx=int(rollout_idx),
         base_seed=int(cand_base_seed),
         ddp_rank=int(ddp_rank),
-        step_idx=0,                        # ✅ step seed 제거(고정)
+        step_idx=0,  # ✅ step seed 제거(고정)
         pose_based=bool(pose_based),
         noise_std=float(noise_std),
     )
@@ -3794,8 +3801,7 @@ def _build_inference_noise_flat_from_bank_for_candidate_range(
         raise ValueError(
             "noise bank 길이가 부족합니다. "
             f"step_idx={s}, future_len={t}, bank_len={L}. "
-            "bank_len은 최소 scenario_finish_step + future_len 이어야 합니다."
-        )
+            "bank_len은 최소 scenario_finish_step + future_len 이어야 합니다.")
 
     # ✅ (K,B,1+Pnn,L,D) 준비 (없으면 여기서 1번만 생성)
     bank_stack = _get_or_build_inference_noise_bank_stack_for_candidate_range(
@@ -3821,6 +3827,7 @@ def _build_inference_noise_flat_from_bank_for_candidate_range(
     # ✅ (K*B, 1+Pnn, T, D)
     noise_flat = noise_chunk.reshape(int(k) * int(b), int(p), int(t), int(d))
     return noise_flat.contiguous()
+
 
 def _build_inference_noise_batch_for_candidate_range(
     *,
@@ -3887,8 +3894,6 @@ def _build_inference_noise_batch_for_candidate_range(
     return noise_flat
 
 
-
-
 def _forward_and_score_candidate_batch(
     *,
     args: Any,
@@ -3951,17 +3956,16 @@ def _forward_and_score_candidate_batch(
     inference_noise_flat: Optional[torch.Tensor] = None
     amortized_random_noise_flat: Optional[torch.Tensor] = None
 
-    need_initial_inference_noise = (not use_amortized) or (use_amortized and int(step_idx) == 0)
+    need_initial_inference_noise = (not use_amortized) or (use_amortized and
+                                                           int(step_idx) == 0)
     need_amortized_random_noise = use_amortized
 
     if need_initial_inference_noise:
         # ✅ noise bank가 준비되어 있으면 bank에서 슬라이스해서 사용
-        use_noise_bank = (
-            (not use_amortized)
-            and isinstance(inference_noise_bank_cache, dict)
-            and isinstance(inference_noise_bank_len, int)
-            and int(inference_noise_bank_len) > 0
-        )
+        use_noise_bank = ((not use_amortized) and
+                          isinstance(inference_noise_bank_cache, dict) and
+                          isinstance(inference_noise_bank_len, int) and
+                          int(inference_noise_bank_len) > 0)
 
         if use_noise_bank:
             inference_noise_flat = _build_inference_noise_flat_from_bank_for_candidate_range(
@@ -3975,7 +3979,7 @@ def _forward_and_score_candidate_batch(
                 rollout_idx=int(rollout_idx),
                 base_seed=int(base_seed),
                 ddp_rank=int(ddp_rank),
-                step_idx=int(step_idx),                 # ✅ slice 시작점
+                step_idx=int(step_idx),  # ✅ slice 시작점
                 pose_based=bool(pose_based_flag),
                 noise_std=float(noise_std_for_inference),
                 seed_stride=int(seed_stride),
@@ -3983,7 +3987,9 @@ def _forward_and_score_candidate_batch(
                 cand_count=int(rollout_repeat),
             )
         else:
-            raise ValueError("inference_noise_bank_cache is required when use_amortized_diffusion=True")
+            raise ValueError(
+                "inference_noise_bank_cache is required when use_amortized_diffusion=True"
+            )
 
     if need_amortized_random_noise:
         # (현재 질문 범위에서는 use_amortized_diffusion=False라서 보통 실행되지 않음)
@@ -4036,7 +4042,8 @@ def _forward_and_score_candidate_batch(
         norm_inputs=norm_br_inputs_step,
     )
 
-    cand_traj_flat = decoder_output["integrated_trajectory"]  # (B*R, 1+Pnn, 1+T, 4)
+    cand_traj_flat = decoder_output[
+        "integrated_trajectory"]  # (B*R, 1+Pnn, 1+T, 4)
 
     if bool(getattr(args, "pose_based", True)):
         target_future_control_seq = None
@@ -4046,8 +4053,7 @@ def _forward_and_score_candidate_batch(
             raise KeyError(
                 "Decoder 출력에 'control_sequence' 키가 없거나 텐서가 아닙니다. "
                 "rollout_time_chunk_size > 1이면서 pose_based=False인 경우, "
-                "모델이 'control_sequence'를 출력하도록 해야 합니다."
-            )
+                "모델이 'control_sequence'를 출력하도록 해야 합니다.")
 
     cand_traj = cand_traj_flat.reshape(
         int(rollout_repeat),
@@ -4057,17 +4063,13 @@ def _forward_and_score_candidate_batch(
         4,
     )
 
-    target_future_control_seq = (
-        target_future_control_seq.reshape(
-            int(rollout_repeat),
-            int(b),
-            int(one_or_pnn),
-            int(future_len),
-            -1,
-        )
-        if target_future_control_seq is not None
-        else None
-    )
+    target_future_control_seq = (target_future_control_seq.reshape(
+        int(rollout_repeat),
+        int(b),
+        int(one_or_pnn),
+        int(future_len),
+        -1,
+    ) if target_future_control_seq is not None else None)
 
     # len_rep/wid_rep: (B*R, 1+Pnn)
     len_rep = unnorm_agent_length_m.repeat(int(rollout_repeat), 1)
@@ -4084,9 +4086,11 @@ def _forward_and_score_candidate_batch(
         unnorm_agent_width_m=wid_rep,
     )
 
-    cand_dist = cand_dist_flat.reshape(int(rollout_repeat), int(b), int(one_or_pnn))
+    cand_dist = cand_dist_flat.reshape(int(rollout_repeat), int(b),
+                                       int(one_or_pnn))
 
     return cand_traj, cand_dist, target_future_control_seq
+
 
 def _compute_candidate_score_mean_over_valid_agents(
         *,
@@ -4153,15 +4157,16 @@ import torch
 
 
 def _select_best_from_candidate_batch_jointly(
-        *,
-        best_traj: Optional[torch.Tensor],
-        best_dist: Optional[torch.Tensor],
-        best_score: Optional[torch.Tensor],
-        best_control_seq: Optional[torch.Tensor],
-        cand_traj: torch.Tensor,  # (Kc, B, 1+Pnn, 1+future_len, 4)
-        cand_dist: torch.Tensor,  # (Kc, B, 1+Pnn)
-        cand_control_seq: Optional[torch.Tensor],  # (Kc, B, 1+Pnn, future_len, C) or None
-        agent_current_is_valid: torch.Tensor,  # (B, 1+Pnn) bool
+    *,
+    best_traj: Optional[torch.Tensor],
+    best_dist: Optional[torch.Tensor],
+    best_score: Optional[torch.Tensor],
+    best_control_seq: Optional[torch.Tensor],
+    cand_traj: torch.Tensor,  # (Kc, B, 1+Pnn, 1+future_len, 4)
+    cand_dist: torch.Tensor,  # (Kc, B, 1+Pnn)
+    cand_control_seq: Optional[
+        torch.Tensor],  # (Kc, B, 1+Pnn, future_len, C) or None
+    agent_current_is_valid: torch.Tensor,  # (B, 1+Pnn) bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """샘플마다 후보 1개를 고르는 방식(select_jointly=True)으로 best를 갱신합니다.
 
@@ -4219,8 +4224,8 @@ def _select_best_from_candidate_batch_jointly(
     # idx_traj: (B, 1, 1+Pnn, 1+future_len, 4)
     idx_traj = group_best_idx[:, None, None, None,
                               None].expand(b, 1, one_pnn, t_traj, 4)
-    group_best_traj = torch.take_along_dim(
-        cand_traj_perm, idx_traj, dim=1).squeeze(1)
+    group_best_traj = torch.take_along_dim(cand_traj_perm, idx_traj,
+                                           dim=1).squeeze(1)
 
     # -------------------------
     # (2) dist 선택
@@ -4228,8 +4233,8 @@ def _select_best_from_candidate_batch_jointly(
     # cand_dist_perm: (B, Kc, 1+Pnn)
     cand_dist_perm = cand_dist.permute(1, 0, 2)
     idx_dist = group_best_idx[:, None, None].expand(b, 1, one_pnn)
-    group_best_dist = torch.take_along_dim(
-        cand_dist_perm, idx_dist, dim=1).squeeze(1)
+    group_best_dist = torch.take_along_dim(cand_dist_perm, idx_dist,
+                                           dim=1).squeeze(1)
 
     # -------------------------
     # (3) control 선택(있을 때만)
@@ -4244,8 +4249,9 @@ def _select_best_from_candidate_batch_jointly(
         # idx_ctl: (B, 1, 1+Pnn, future_len, C)
         idx_ctl = group_best_idx[:, None, None, None,
                                  None].expand(b, 1, one_pnn, t_ctl, c_ctl)
-        group_best_control_seq = torch.take_along_dim(
-            cand_ctl_perm, idx_ctl, dim=1).squeeze(1)
+        group_best_control_seq = torch.take_along_dim(cand_ctl_perm,
+                                                      idx_ctl,
+                                                      dim=1).squeeze(1)
 
     # -------------------------
     # (4) best 갱신
@@ -4264,7 +4270,6 @@ def _select_best_from_candidate_batch_jointly(
     return best_traj, best_dist, best_score, best_control_seq
 
 
-
 from typing import Optional, Tuple
 import torch
 
@@ -4276,7 +4281,8 @@ def _select_best_from_candidate_batch_per_agent(
     best_control_seq: Optional[torch.Tensor],
     cand_traj: torch.Tensor,  # (Kc, B, 1+Pnn, 1+future_len, 4)
     cand_dist: torch.Tensor,  # (Kc, B, 1+Pnn)
-    cand_control_seq: Optional[torch.Tensor],  # (Kc, B, 1+Pnn, future_len, C) or None
+    cand_control_seq: Optional[
+        torch.Tensor],  # (Kc, B, 1+Pnn, future_len, C) or None
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """에이전트마다 후보를 따로 고르는 방식(select_jointly=False)으로 best를 갱신합니다.
 
@@ -4323,8 +4329,8 @@ def _select_best_from_candidate_batch_per_agent(
     # idx_traj: (B, 1+Pnn, 1, 1+future_len, 4)
     idx_traj = group_best_idx[..., None, None,
                               None].expand(b, one_pnn, 1, t_traj, 4)
-    group_best_traj = torch.take_along_dim(
-        cand_traj_perm, idx_traj, dim=2).squeeze(2)
+    group_best_traj = torch.take_along_dim(cand_traj_perm, idx_traj,
+                                           dim=2).squeeze(2)
 
     # -------------------------
     # (2) control 선택 (agent별 idx, 있을 때만)
@@ -4339,8 +4345,9 @@ def _select_best_from_candidate_batch_per_agent(
         # idx_ctl: (B, 1+Pnn, 1, future_len, C)
         idx_ctl = group_best_idx[..., None, None,
                                  None].expand(b, one_pnn, 1, t_ctl, c_ctl)
-        group_best_control_seq = torch.take_along_dim(
-            cand_ctl_perm, idx_ctl, dim=2).squeeze(2)
+        group_best_control_seq = torch.take_along_dim(cand_ctl_perm,
+                                                      idx_ctl,
+                                                      dim=2).squeeze(2)
 
     # -------------------------
     # (3) best 갱신
@@ -4358,12 +4365,9 @@ def _select_best_from_candidate_batch_per_agent(
     return best_traj, best_dist, best_control_seq
 
 
-
 from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
-
-
 
 
 def _select_best_trajectory_by_sample_k(
@@ -4400,45 +4404,44 @@ def _select_best_trajectory_by_sample_k(
     seed_stride = 10_000_000
 
     try:
-        (cand_traj_batch, cand_dist_batch, target_future_control_seq) = _forward_and_score_candidate_batch(
-            args=args,
-            model=model,
-            norm_inputs_step=norm_inputs_step,
-            state_normalizer=state_normalizer,
-            unnorm_outputs_copy=unnorm_outputs_copy,
-            unnorm_agent_length_m=unnorm_agent_length_m,
-            unnorm_agent_width_m=unnorm_agent_width_m,
-            batch_size=int(batch_size),
-            one_or_pnn=int(one_or_pnn),
-            future_len=int(future_len),
-            rollout_idx=int(rollout_idx),
-            base_seed=int(base_seed),
-            ddp_rank=int(ddp_rank),
-            step_idx=int(step_idx),
-            cand_start_idx=0,
-            cand_count=int(fine_tune_gen_k),
-            seed_stride=int(seed_stride),
-            gap=int(gap),
-            # ✅ noise bank 전달
-            inference_noise_bank_cache=inference_noise_bank_cache,
-            inference_noise_bank_len=inference_noise_bank_len,
-        )
+        (cand_traj_batch, cand_dist_batch,
+         target_future_control_seq) = _forward_and_score_candidate_batch(
+             args=args,
+             model=model,
+             norm_inputs_step=norm_inputs_step,
+             state_normalizer=state_normalizer,
+             unnorm_outputs_copy=unnorm_outputs_copy,
+             unnorm_agent_length_m=unnorm_agent_length_m,
+             unnorm_agent_width_m=unnorm_agent_width_m,
+             batch_size=int(batch_size),
+             one_or_pnn=int(one_or_pnn),
+             future_len=int(future_len),
+             rollout_idx=int(rollout_idx),
+             base_seed=int(base_seed),
+             ddp_rank=int(ddp_rank),
+             step_idx=int(step_idx),
+             cand_start_idx=0,
+             cand_count=int(fine_tune_gen_k),
+             seed_stride=int(seed_stride),
+             gap=int(gap),
+             # ✅ noise bank 전달
+             inference_noise_bank_cache=inference_noise_bank_cache,
+             inference_noise_bank_len=inference_noise_bank_len,
+         )
     except BaseException as e:
         if _is_gpu_oom_error(e):
             _clear_gpu_cache_after_oom()
             raise RuntimeError(
                 "GPU 메모리가 부족해서 fine_tune_gen_k 후보를 한 번에 처리하지 못했습니다. "
                 f"fine_tune_gen_k={fine_tune_gen_k}. "
-                "이 설정을 낮추거나, 후보별 버퍼를 안전하게 관리하는 방식이 필요합니다."
-            ) from e
+                "이 설정을 낮추거나, 후보별 버퍼를 안전하게 관리하는 방식이 필요합니다.") from e
         raise
 
     best_control_seq: Optional[torch.Tensor] = None
 
     if select_jointly:
         target_agent_current_is_valid = _build_target_agent_current_is_valid_mask(
-            norm_inputs_step=norm_inputs_step,
-        )
+            norm_inputs_step=norm_inputs_step,)
         best_traj, best_dist, _best_score, best_control_seq = _select_best_from_candidate_batch_jointly(
             best_traj=None,
             best_dist=None,
@@ -4464,7 +4467,6 @@ def _select_best_trajectory_by_sample_k(
     del target_future_control_seq
 
     return best_traj, best_dist, best_control_seq
-
 
 
 def _build_recovery_step_count_per_agent(
@@ -4683,6 +4685,7 @@ def _apply_recovery_if_needed(
 
     return out
 
+
 def _traj11_to_traj3_heading(traj_11: torch.Tensor) -> torch.Tensor:
     """(x,y,cos,sin,...) 상태열에서 (x,y,heading)으로 바꿉니다.
 
@@ -4701,10 +4704,8 @@ def _traj11_to_traj3_heading(traj_11: torch.Tensor) -> torch.Tensor:
     if traj_11.dim() < 1:
         raise ValueError(f"traj_11은 최소 1차원이어야 합니다. got dim={traj_11.dim()}")
     if int(traj_11.shape[-1]) < 4:
-        raise ValueError(
-            "traj_11 마지막 차원은 최소 4(x,y,cos,sin)이어야 합니다. "
-            f"got shape={tuple(traj_11.shape)}"
-        )
+        raise ValueError("traj_11 마지막 차원은 최소 4(x,y,cos,sin)이어야 합니다. "
+                         f"got shape={tuple(traj_11.shape)}")
 
     x = traj_11[..., 0]
     y = traj_11[..., 1]
@@ -4712,6 +4713,7 @@ def _traj11_to_traj3_heading(traj_11: torch.Tensor) -> torch.Tensor:
     sin_h = traj_11[..., 3]
     heading = torch.atan2(sin_h, cos_h)
     return torch.stack([x, y, heading], dim=-1)
+
 
 from typing import Tuple
 import torch
@@ -4749,14 +4751,20 @@ def _normalize_cos_sin(
     cos_norm = cos_seq / r
     sin_norm = sin_seq / r
     return cos_norm, sin_norm
+
+
 from typing import Union
 
-def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
+
+def _to_scalar_dt(value: Union[float, np.ndarray],
+                  ref: NDArray[np.generic]) -> np.floating:
     """dt를 ref와 같은 dtype의 '스칼라'로 정리합니다."""
     dt_arr = np.asarray(value, dtype=ref.dtype)
     if dt_arr.size != 1:
-        raise ValueError(f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
+        raise ValueError(
+            f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
     return dt_arr.reshape(()).item()
+
 
 def differentiate_numpy_pose3_to_control3(
     cur_future_pose_gt_3_dim: torch.Tensor,  # (B, P, 1+T, 3)
@@ -4780,11 +4788,10 @@ def differentiate_numpy_pose3_to_control3(
     """
     if not isinstance(cur_future_pose_gt_3_dim, torch.Tensor):
         raise TypeError("cur_future_pose_gt_3_dim은 torch.Tensor여야 합니다.")
-    if cur_future_pose_gt_3_dim.dim() != 4 or int(cur_future_pose_gt_3_dim.shape[-1]) != 3:
-        raise ValueError(
-            "cur_future_pose_gt_3_dim은 (B, P, 1+T, 3)이어야 합니다. "
-            f"got shape={tuple(cur_future_pose_gt_3_dim.shape)}"
-        )
+    if cur_future_pose_gt_3_dim.dim() != 4 or int(
+            cur_future_pose_gt_3_dim.shape[-1]) != 3:
+        raise ValueError("cur_future_pose_gt_3_dim은 (B, P, 1+T, 3)이어야 합니다. "
+                         f"got shape={tuple(cur_future_pose_gt_3_dim.shape)}")
 
     dt_f = float(dt)
     if (not torch.isfinite(torch.tensor(dt_f))) or dt_f <= 0.0:
@@ -4826,6 +4833,7 @@ def differentiate_numpy_pose3_to_control3(
     out = torch.stack([vx_b, vy_b, yaw_rate], dim=-1)  # (B, P, T, 3)
     return out.to(dtype=cur_future_pose_gt_3_dim.dtype)
 
+
 from typing import Tuple
 import torch
 
@@ -4833,7 +4841,8 @@ import torch
 def _build_generated_demo_futures_from_selected_traj(
     *,
     unnorm_selected_gt_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, C>=4)
-    target_cur_fut_gt_is_valid: torch.Tensor,  # (B, 1+Pnn, 1+future_len) bool/0-1
+    target_cur_fut_gt_is_valid: torch.
+    Tensor,  # (B, 1+Pnn, 1+future_len) bool/0-1
     dt: float = 0.1,
     eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -4872,13 +4881,11 @@ def _build_generated_demo_futures_from_selected_traj(
     if unnorm_selected_gt_traj.dim() != 4:
         raise ValueError(
             "unnorm_selected_gt_traj는 (B, 1+Pnn, 1+future_len, C) 이어야 합니다. "
-            f"got shape={tuple(unnorm_selected_gt_traj.shape)}"
-        )
+            f"got shape={tuple(unnorm_selected_gt_traj.shape)}")
     if int(unnorm_selected_gt_traj.shape[-1]) < 4:
         raise ValueError(
             "unnorm_selected_gt_traj 마지막 차원은 최소 4(x,y,cos,sin)이어야 합니다. "
-            f"got shape={tuple(unnorm_selected_gt_traj.shape)}"
-        )
+            f"got shape={tuple(unnorm_selected_gt_traj.shape)}")
 
     if not isinstance(target_cur_fut_gt_is_valid, torch.Tensor):
         raise TypeError("target_cur_fut_gt_is_valid는 torch.Tensor여야 합니다.")
@@ -4896,16 +4903,14 @@ def _build_generated_demo_futures_from_selected_traj(
     if frame_is_valid.dim() != 3:
         raise ValueError(
             "target_cur_fut_gt_is_valid는 (B, 1+Pnn, 1+future_len) 이어야 합니다. "
-            f"got shape={tuple(frame_is_valid.shape)}"
-        )
-    if (int(frame_is_valid.shape[0]) != b
-            or int(frame_is_valid.shape[1]) != one_pnn
-            or int(frame_is_valid.shape[2]) != t_all):
+            f"got shape={tuple(frame_is_valid.shape)}")
+    if (int(frame_is_valid.shape[0]) != b or
+            int(frame_is_valid.shape[1]) != one_pnn or
+            int(frame_is_valid.shape[2]) != t_all):
         raise ValueError(
             "target_cur_fut_gt_is_valid shape가 unnorm_selected_gt_traj와 맞지 않습니다. "
             f"traj={tuple(unnorm_selected_gt_traj.shape[:3])}, "
-            f"valid={tuple(frame_is_valid.shape)}"
-        )
+            f"valid={tuple(frame_is_valid.shape)}")
 
     dt_f = float(dt)
     if (not torch.isfinite(torch.tensor(dt_f))) or dt_f <= 0.0:
@@ -4914,8 +4919,9 @@ def _build_generated_demo_futures_from_selected_traj(
     # ------------------------------------------------------------
     # (1) 저장용 미래 포즈(4차원)
     # ------------------------------------------------------------
-    selected_future_pose4 = unnorm_selected_gt_traj[:, :, 1:, 0:4]  # (B, 1+Pnn, future_len, 4)
-    demo_ego = selected_future_pose4[:, 0, :, :]    # (B, future_len, 4)
+    selected_future_pose4 = unnorm_selected_gt_traj[:, :, 1:, 0:
+                                                    4]  # (B, 1+Pnn, future_len, 4)
+    demo_ego = selected_future_pose4[:, 0, :, :]  # (B, future_len, 4)
     demo_near = selected_future_pose4[:, 1:, :, :]  # (B, Pnn, future_len, 4)
 
     # ------------------------------------------------------------
@@ -4929,8 +4935,10 @@ def _build_generated_demo_futures_from_selected_traj(
     #     pose3: (B, 1+Pnn, 1+future_len, 3)
     #     control: (B, 1+Pnn, future_len, 3)
     # ------------------------------------------------------------
-    pose4_for_heading = unnorm_selected_gt_traj[..., 0:4]  # (B, 1+Pnn, 1+future_len, 4)
-    pose3 = _traj11_to_traj3_heading(pose4_for_heading)  # (B, 1+Pnn, 1+future_len, 3)
+    pose4_for_heading = unnorm_selected_gt_traj[
+        ..., 0:4]  # (B, 1+Pnn, 1+future_len, 4)
+    pose3 = _traj11_to_traj3_heading(
+        pose4_for_heading)  # (B, 1+Pnn, 1+future_len, 3)
 
     future_seg_control_gt_3_dim = differentiate_numpy_pose3_to_control3(
         pose3,
@@ -4943,12 +4951,10 @@ def _build_generated_demo_futures_from_selected_traj(
     # ------------------------------------------------------------
     # (4) 무효 구간은 0으로 고정
     # ------------------------------------------------------------
-    future_seg_control_gt_3_dim = future_seg_control_gt_3_dim * seg_is_valid.unsqueeze(-1).to(
-        dtype=future_seg_control_gt_3_dim.dtype
-    )
+    future_seg_control_gt_3_dim = future_seg_control_gt_3_dim * seg_is_valid.unsqueeze(
+        -1).to(dtype=future_seg_control_gt_3_dim.dtype)
 
     return demo_ego, demo_near, future_seg_control_gt_3_dim
-
 
 
 def _get_ego_future_11(
@@ -5435,7 +5441,6 @@ def _transform_pose_4_dim_inplace(
     pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
 
 
-
 def _enforce_unit_cos_sin_in_state_11_inplace(
     state_11: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -5470,10 +5475,8 @@ def _enforce_unit_cos_sin_in_state_11_inplace(
     if not isinstance(state_11, torch.Tensor):
         raise TypeError("state_11은 torch.Tensor여야 합니다.")
     if state_11.dim() < 1 or int(state_11.shape[-1]) != 11:
-        raise ValueError(
-            "state_11은 (..., 11) 형태여야 합니다. "
-            f"got shape={tuple(state_11.shape)}"
-        )
+        raise ValueError("state_11은 (..., 11) 형태여야 합니다. "
+                         f"got shape={tuple(state_11.shape)}")
     if not isinstance(valid_mask, torch.Tensor):
         raise TypeError("valid_mask는 torch.Tensor여야 합니다.")
 
@@ -5482,8 +5485,7 @@ def _enforce_unit_cos_sin_in_state_11_inplace(
     if got_mask_shape != expected_mask_shape:
         raise ValueError(
             "valid_mask shape가 state_11과 맞지 않습니다. "
-            f"expected={expected_mask_shape}, got={got_mask_shape}"
-        )
+            f"expected={expected_mask_shape}, got={got_mask_shape}")
 
     # valid_mask -> bool (0이 아니면 True)
     if valid_mask.dtype == torch.bool:
@@ -5571,6 +5573,7 @@ def _enforce_unit_cos_sin_in_past_inputs_inplace(
             valid_mask=valid,
             eps=float(eps),
         )
+
 
 def _build_norm_inputs_from_unnorm_inputs(
     unnorm_inputs_copy: Dict[str, Any],
@@ -5929,10 +5932,15 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     future_seg_control_gt_3_dim: (B*R, (1+)Pnn, future_len, 3)
     future_seg_control_gt_3_dim 도 마찬가지로 shift 해주고, 뒤쪽 gap 구간은 0으로 채우고, bool로 맞춰야 합니다.
     """
-    future_seg_control_gt_3_dim = unnorm_outputs_copy["future_seg_control_gt_3_dim"]
-    future_seg_control_gt_3_dim[:, :, :future_len - gap, :] = future_seg_control_gt_3_dim[:, :, gap:, :].clone()
+    future_seg_control_gt_3_dim = unnorm_outputs_copy[
+        "future_seg_control_gt_3_dim"]
+    future_seg_control_gt_3_dim[:, :, :future_len -
+                                gap, :] = future_seg_control_gt_3_dim[:, :,
+                                                                      gap:, :].clone(
+                                                                      )
     future_seg_control_gt_3_dim[:, :, future_len - gap:, :] = 0.0
-    unnorm_outputs_copy["future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim
+    unnorm_outputs_copy[
+        "future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim
     # future_seg_control_is_valid : (B*R, (1+)Pnn, future_len) 도 업데이트 해야함.
     """
     future_seg_control_is_valid 도 마찬가지로 shift 해주고, 뒤쪽 gap 구간은 0으로 채우고, bool로 맞춰야 합니다.
@@ -5940,10 +5948,14 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     future_seg_control_is_valid = unnorm_outputs_copy[
         "future_seg_control_is_valid"]  # (B*R, (1+)Pnn, future_len)
     future_seg_control_is_valid[:, :, :future_len -
-                                gap] = future_seg_control_is_valid[:, :, gap:].clone()
+                                gap] = future_seg_control_is_valid[:, :,
+                                                                   gap:].clone(
+                                                                   )
     future_seg_control_is_valid[:, :, future_len - gap:] = 0
-    future_seg_control_is_valid = future_seg_control_is_valid.to(dtype=torch.bool)
-    unnorm_outputs_copy["future_seg_control_is_valid"] = future_seg_control_is_valid
+    future_seg_control_is_valid = future_seg_control_is_valid.to(
+        dtype=torch.bool)
+    unnorm_outputs_copy[
+        "future_seg_control_is_valid"] = future_seg_control_is_valid
 
 
 def _match_device_and_dtype(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -5961,6 +5973,7 @@ def _match_device_and_dtype(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     if x.device == ref.device and x.dtype == ref.dtype:
         return x
     return x.to(device=ref.device, dtype=ref.dtype)
+
 
 def _update_target_seg_control_for_time_chunk(
     unnorm_inputs_copy: Dict[str, Any],
@@ -6002,18 +6015,18 @@ def _update_target_seg_control_for_time_chunk(
     if past_ctrl.dim() != 4 or int(past_ctrl.shape[-1]) != 3:
         raise ValueError(
             "past_seg_control_gt_3_dim은 (B, 1+Pnn, past_len, 3) 이어야 합니다. "
-            f"got shape={tuple(past_ctrl.shape)}"
-        )
+            f"got shape={tuple(past_ctrl.shape)}")
 
-    if unnorm_target_control_chunk.dim() != 4 or int(unnorm_target_control_chunk.shape[-1]) != 3:
+    if unnorm_target_control_chunk.dim() != 4 or int(
+            unnorm_target_control_chunk.shape[-1]) != 3:
         raise ValueError(
             "unnorm_target_control_chunk는 (B, 1+Pnn, gap, 3) 이어야 합니다. "
-            f"got shape={tuple(unnorm_target_control_chunk.shape)}"
-        )
+            f"got shape={tuple(unnorm_target_control_chunk.shape)}")
 
-    if int(past_ctrl.shape[0]) != int(unnorm_target_control_chunk.shape[0]) or int(past_ctrl.shape[1]) != int(
-        unnorm_target_control_chunk.shape[1]
-    ):
+    if int(past_ctrl.shape[0]) != int(
+            unnorm_target_control_chunk.shape[0]) or int(
+                past_ctrl.shape[1]) != int(
+                    unnorm_target_control_chunk.shape[1]):
         raise ValueError(
             "batch 축(B) 또는 agent 축(1+Pnn) 크기가 맞지 않습니다. "
             f"past={tuple(past_ctrl.shape[:2])}, chunk={tuple(unnorm_target_control_chunk.shape[:2])}"
@@ -6023,15 +6036,20 @@ def _update_target_seg_control_for_time_chunk(
     gap = int(unnorm_target_control_chunk.shape[2])
     if past_len <= 0 or gap <= 0:
         return
-
     """
     """
-    ego_agent_cur_is_valid = unnorm_inputs_copy["ego_agent_past_is_valid"][:, -1:] # (B*R, 1)
-    near_agents_cur_is_valid = unnorm_inputs_copy["near_agents_past_is_valid"][:, :, -1] # (B, Pnn,)
-    current_seg_control_is_valid = torch.cat([ego_agent_cur_is_valid, near_agents_cur_is_valid], dim=1) # (B*R, 1+Pnn)
-    current_seg_control_is_valid = current_seg_control_is_valid.unsqueeze(-1) # (B*R, 1+Pnn, 1)
+    ego_agent_cur_is_valid = unnorm_inputs_copy[
+        "ego_agent_past_is_valid"][:, -1:]  # (B*R, 1)
+    near_agents_cur_is_valid = unnorm_inputs_copy[
+        "near_agents_past_is_valid"][:, :, -1]  # (B, Pnn,)
+    current_seg_control_is_valid = torch.cat(
+        [ego_agent_cur_is_valid, near_agents_cur_is_valid],
+        dim=1)  # (B*R, 1+Pnn)
+    current_seg_control_is_valid = current_seg_control_is_valid.unsqueeze(
+        -1)  # (B*R, 1+Pnn, 1)
     # current_seg_chunk_control_is_valid :  (B*R, 1+Pnn, 1) -> expand -> (B*R, 1+Pnn, gap)
-    current_seg_chunk_control_is_valid = current_seg_control_is_valid.expand(-1, -1, gap)
+    current_seg_chunk_control_is_valid = current_seg_control_is_valid.expand(
+        -1, -1, gap)
     # mask_f: (B*R, 1+Pnn, gap) -> (B*R, 1+Pnn, gap, 1)
     # 1) ego/near valid로 control chunk 마스킹
     mask_f = current_seg_chunk_control_is_valid.unsqueeze(-1)
@@ -6040,18 +6058,22 @@ def _update_target_seg_control_for_time_chunk(
 
     # 2) ✅ dtype/device 불일치가 있으면 여기서만 맞춤 (이미 같으면 no-op)
     masked_control = _match_device_and_dtype(masked_control, past_ctrl)
-    if gap <=0 or gap > past_len:
+    if gap <= 0 or gap > past_len:
         raise ValueError(f"gap={gap}, past_len={past_len}")
 
     # 일반 케이스: 앞쪽 move개 버리고, 뒤에 move개 붙이기
-    left = past_ctrl[:, :, gap:, :]               # (B*R, 1+Pnn, past_len-move, 3)
-    unnorm_inputs_copy["past_seg_control_gt_3_dim"] = torch.cat([left, masked_control], dim=2)
+    left = past_ctrl[:, :, gap:, :]  # (B*R, 1+Pnn, past_len-move, 3)
+    unnorm_inputs_copy["past_seg_control_gt_3_dim"] = torch.cat(
+        [left, masked_control], dim=2)
 
     # past_seg_control_is_valid: (B*R, 1+Pnn, past_len) 이것도 업데이트 해야함
-    past_seg_control_is_valid = unnorm_inputs_copy["past_seg_control_is_valid"] # (B*R, 1+Pnn, past_len)
-    unnorm_inputs_copy["past_seg_control_is_valid"] = torch.cat(
-        [past_seg_control_is_valid[:, :, gap:], current_seg_chunk_control_is_valid], dim=2
-    )
+    past_seg_control_is_valid = unnorm_inputs_copy[
+        "past_seg_control_is_valid"]  # (B*R, 1+Pnn, past_len)
+    unnorm_inputs_copy["past_seg_control_is_valid"] = torch.cat([
+        past_seg_control_is_valid[:, :, gap:],
+        current_seg_chunk_control_is_valid
+    ],
+                                                                dim=2)
 
 
 def _update_merged_inputs_unnorm_inplace_for_time_chunk(
@@ -6059,9 +6081,9 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     unnorm_outputs_copy: Dict[str, Any],
     unnorm_ego_pose_chunk: torch.Tensor,  # (B, gap, 4)
     unnorm_near_pose_chunk: torch.Tensor,  # (B, Pnn, gap, 4)
-        unnorm_target_control_chunk: Optional[torch.Tensor],
-        # (B, 1+Pnn, gap, 3)
-        cached_valid_masks: Optional[Dict[str, torch.Tensor]],
+    unnorm_target_control_chunk: Optional[torch.Tensor],
+    # (B, 1+Pnn, gap, 3)
+    cached_valid_masks: Optional[Dict[str, torch.Tensor]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     1) 여러 스텝(gap개)을 한 번에 past/GT에 반영하고,
@@ -6096,7 +6118,8 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     # ✅ (추가) past_seg_control_gt_3_dim 업데이트  ( past_seg_control_is_valid 도 업데이트 해야함)
     _update_target_seg_control_for_time_chunk(
         unnorm_inputs_copy=unnorm_inputs_copy,
-        unnorm_target_control_chunk=unnorm_target_control_chunk,  # (B, 1+Pnn, gap, 3) or None
+        unnorm_target_control_chunk=
+        unnorm_target_control_chunk,  # (B, 1+Pnn, gap, 3) or None
     )
     # 5) 미래 GT/valid 갱신
     _update_future_gt_and_valid_inplace_for_time_chunk(

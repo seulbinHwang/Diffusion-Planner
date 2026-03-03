@@ -313,11 +313,11 @@ class Decoder(nn.Module):
         self.t_tau = torch.clamp(self.t_tau, max=t_max)  # (T,)
 
     def _get_amortized_random_noise_from_inputs(
-            self,
-            inputs: Dict[str, torch.Tensor],
-            batch_size: int,
-            one_or_Pnn: int,
-            target_current_xyyaw: torch.Tensor,
+        self,
+        inputs: Dict[str, torch.Tensor],
+        batch_size: int,
+        one_or_Pnn: int,
+        target_current_xyyaw: torch.Tensor,
     ) -> torch.Tensor:
         """amortized에서 사용할 표준정규 노이즈(eps)를 inputs에서 꺼냅니다.
 
@@ -348,8 +348,7 @@ class Decoder(nn.Module):
         noise = inputs.get("amortized_random_noise", None)
         if noise is None:
             raise KeyError(
-                "amortized 추론에는 inputs['amortized_random_noise']가 필요합니다."
-            )
+                "amortized 추론에는 inputs['amortized_random_noise']가 필요합니다.")
         if not isinstance(noise, torch.Tensor):
             raise TypeError(
                 "inputs['amortized_random_noise']는 torch.Tensor여야 합니다.")
@@ -376,8 +375,7 @@ class Decoder(nn.Module):
             raise ValueError(
                 "inputs['amortized_random_noise']가 (B,A,T,D)가 아닌데, "
                 "gap을 알 수 없어 (B,A,gap,D)로도 검증할 수 없습니다. "
-                "inputs['rollout_time_chunk_size']를 확인해 주세요."
-            )
+                "inputs['rollout_time_chunk_size']를 확인해 주세요.")
 
         gap = int(max(0, min(int(gap_val), int(future_len))))
         if gap <= 0:
@@ -393,7 +391,6 @@ class Decoder(nn.Module):
             )
 
         return _ensure_tensor_on_ref(noise, target_current_xyyaw)
-
 
     def _get_inference_noise_from_inputs(
         self,
@@ -1342,10 +1339,10 @@ class Decoder(nn.Module):
         return sigma2_over_alpha.view(B, 1, 1)  # (B,1,1)
 
     def _compute_guidance_grad_wrt_x(
-            self,
-            x_t_flat: torch.Tensor,
-            t_eff: torch.Tensor,
-            classifier_kwargs: Dict[str, object],
+        self,
+        x_t_flat: torch.Tensor,
+        t_eff: torch.Tensor,
+        classifier_kwargs: Dict[str, object],
     ) -> torch.Tensor:
         """guidance_fn 출력(점수)을 x에 대해 미분한 값을 구합니다.
 
@@ -1371,12 +1368,10 @@ class Decoder(nn.Module):
         """
         if self._guidance_fn is None:
             raise RuntimeError(
-                "self._guidance_fn is None, but guidance grad was requested."
-            )
+                "self._guidance_fn is None, but guidance grad was requested.")
         if x_t_flat.dim() != 3:
             raise ValueError(
-                f"x_t_flat must be 3D (B,P,F). got {tuple(x_t_flat.shape)}"
-            )
+                f"x_t_flat must be 3D (B,P,F). got {tuple(x_t_flat.shape)}")
         if t_eff.dim() != 1:
             raise ValueError(f"t_eff must be 1D (B,). got {tuple(t_eff.shape)}")
 
@@ -1384,12 +1379,9 @@ class Decoder(nn.Module):
 
         # 바깥이 torch.no_grad / torch.inference_mode 여도 여기서는 미분이 가능해야 합니다.
         with torch.inference_mode(False), torch.enable_grad():
-            x_in: torch.Tensor = (
-                x_t_flat.detach()
-                .to(dtype=torch.float32)
-                .clone()
-                .requires_grad_(True)
-            )  # (B,P,F) float32, requires_grad=True
+            x_in: torch.Tensor = (x_t_flat.detach().to(
+                dtype=torch.float32).clone().requires_grad_(True)
+                                 )  # (B,P,F) float32, requires_grad=True
 
             t_in: torch.Tensor = t_eff.detach().to(
                 device=x_in.device,
@@ -1405,17 +1397,14 @@ class Decoder(nn.Module):
                     score = self._guidance_fn(x_in, t_in, **classifier_kwargs)
 
                 if not isinstance(score, torch.Tensor):
-                    raise TypeError(
-                        "guidance_fn must return a torch.Tensor. "
-                        f"got {type(score)}"
-                    )
+                    raise TypeError("guidance_fn must return a torch.Tensor. "
+                                    f"got {type(score)}")
                 # ✅ no_grad/inference_mode/연결 끊김으로 guidance가 조용히 무력화되는 걸 방지
                 if not score.requires_grad:
                     raise RuntimeError(
                         "guidance_fn output does not require grad w.r.t x. "
                         "guidance가 no_grad/inference_mode 영향으로 조용히 꺼졌거나, "
-                        "guidance_fn 내부에서 x와의 연결이 끊겼을 수 있습니다."
-                    )
+                        "guidance_fn 내부에서 x와의 연결이 끊겼을 수 있습니다.")
 
                 score_sum: torch.Tensor = score.float().sum()
 
@@ -1852,14 +1841,14 @@ class Decoder(nn.Module):
         return decoder_output_dict
 
     def _set_amortized_buffer_from_sequence(
-            self,
-            diffusion_future_sequence: torch.Tensor,
-            # (B, (1+)Pnn, future_len, 4 or 3)  == "x0" 역할
-            random_noise: torch.Tensor,
-            # do_shift=False: (B, (1+)Pnn, future_len, D) 필요
-            # do_shift=True : (B, (1+)Pnn, future_len, D) 또는 (B, (1+)Pnn, gap, D)
-            rollout_time_chunk_size: Optional[int] = None,
-            do_shift: bool = True,
+        self,
+        diffusion_future_sequence: torch.Tensor,
+        # (B, (1+)Pnn, future_len, 4 or 3)  == "x0" 역할
+        random_noise: torch.Tensor,
+        # do_shift=False: (B, (1+)Pnn, future_len, D) 필요
+        # do_shift=True : (B, (1+)Pnn, future_len, D) 또는 (B, (1+)Pnn, gap, D)
+        rollout_time_chunk_size: Optional[int] = None,
+        do_shift: bool = True,
     ) -> None:
         """diffusion_future_sequence(x0)와 eps로 다음 스텝의 noisy 버퍼(z)를 만듭니다.
 
@@ -1895,8 +1884,7 @@ class Decoder(nn.Module):
         if diffusion_future_sequence.dim() != 4:
             raise ValueError(
                 "diffusion_future_sequence는 (B, (1+)Pnn, T, D) 4D여야 합니다. "
-                f"got shape={tuple(diffusion_future_sequence.shape)}"
-            )
+                f"got shape={tuple(diffusion_future_sequence.shape)}")
 
         B = int(diffusion_future_sequence.shape[0])
         P = int(diffusion_future_sequence.shape[1])
@@ -1925,8 +1913,8 @@ class Decoder(nn.Module):
             if rollout_time_chunk_size is None:
                 raise ValueError(
                     "do_shift=True 인데 rollout_time_chunk_size(gap)가 없습니다.")
-            gap = int(
-                max(0, min(int(rollout_time_chunk_size), int(future_len))))
+            gap = int(max(0, min(int(rollout_time_chunk_size),
+                                 int(future_len))))
 
             # gap==0이면 eps/x0를 그대로 유지하는 편이 안전
             if gap == 0:
@@ -1942,16 +1930,13 @@ class Decoder(nn.Module):
                     raise ValueError(
                         "do_shift=True에서 random_noise shape는 "
                         f"(full)={full_expected} 또는 (tail)={tail_expected} 여야 합니다. "
-                        f"got={tuple(random_noise.shape)}"
-                    )
+                        f"got={tuple(random_noise.shape)}")
 
         device_type = diffusion_future_sequence.device.type
 
         # t_tau: (B, future_len)
-        batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(B,
-                                                                            1).to(
-            device=diffusion_future_sequence.device
-        )
+        batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
+            B, 1).to(device=diffusion_future_sequence.device)
 
         # -------------------------
         # (A) x0 shift 준비
@@ -1975,8 +1960,7 @@ class Decoder(nn.Module):
             if self._amortized_buffer_eps is None:
                 raise RuntimeError(
                     "do_shift=True 인데 self._amortized_buffer_eps가 없습니다. "
-                    "warm-up(do_shift=False)에서 eps 버퍼를 먼저 세팅해야 합니다."
-                )
+                    "warm-up(do_shift=False)에서 eps 버퍼를 먼저 세팅해야 합니다.")
             if tuple(self._amortized_buffer_eps.shape) != full_expected:
                 raise RuntimeError(
                     "self._amortized_buffer_eps shape가 예상과 다릅니다. "
@@ -1996,16 +1980,16 @@ class Decoder(nn.Module):
 
                 if gap < future_len:
                     # 기존 eps를 앞으로 당김
-                    eps_shifted[:, :, :future_len - gap, :] = prev_eps[
-                        :, :, gap:, :]
+                    eps_shifted[:, :, :future_len - gap, :] = prev_eps[:, :,
+                                                                       gap:, :]
 
                     # 새 tail(gap) 채우기
                     if noise_mode == "tail":
                         tail_eps = random_noise  # (B,P,gap,D)
                     else:
                         # full -> tail slice
-                        tail_eps = random_noise[
-                            :, :, future_len - gap:, :]  # (B,P,gap,D)
+                        tail_eps = random_noise[:, :, future_len -
+                                                gap:, :]  # (B,P,gap,D)
 
                     eps_shifted[:, :, future_len - gap:, :] = tail_eps
                 else:
@@ -2022,8 +2006,8 @@ class Decoder(nn.Module):
             x0_f32 = x0_shifted.to(dtype=torch.float32)
             t_f32 = batch_diffusion_time.to(dtype=torch.float32)
 
-            mean_f32, std_f32 = self.sde.marginal_prob(x0_f32,
-                                                       t_f32)  # mean=alpha*x0, std=sigma
+            mean_f32, std_f32 = self.sde.marginal_prob(
+                x0_f32, t_f32)  # mean=alpha*x0, std=sigma
             eps_f32 = eps_shifted.to(device=x0_f32.device, dtype=torch.float32)
 
             z_f32 = mean_f32 + std_f32 * eps_f32  # (B,P,T,D)
@@ -2489,11 +2473,10 @@ class Decoder(nn.Module):
                         target_future_valid=target_future_valid,
                     )
                 tail = inputs.get("amortized_random_noise_tail", None)
-                if (inputs.get("inference_noise",
-                               None) is not None) and isinstance(tail,
-                                                                 torch.Tensor):
-                    amortized_random_noise = _ensure_tensor_on_ref(tail,
-                                                                   target_current_xyyaw)
+                if (inputs.get("inference_noise", None)
+                        is not None) and isinstance(tail, torch.Tensor):
+                    amortized_random_noise = _ensure_tensor_on_ref(
+                        tail, target_current_xyyaw)
                 else:
                     amortized_random_noise = self._get_amortized_random_noise_from_inputs(
                         inputs=inputs,
@@ -2717,11 +2700,11 @@ class DiT(nn.Module):
         # 초기 base logit(대략 -6)을 "실제 모듈 바이어스"에서 읽어 계산
         # - time 모듈 바이어스(보통 -3) + composer head 바이어스(보통 -3)
         time_bias: float = float(
-            self.pram_v2_time_mod.lin_logit_gate.bias.detach().view(-1)[
-                0].item())
+            self.pram_v2_time_mod.lin_logit_gate.bias.detach().view(
+                -1)[0].item())
         base_bias: float = float(
-            self.pram_v2_composer.head_logit_gate.bias.detach().view(-1)[
-                0].item())
+            self.pram_v2_composer.head_logit_gate.bias.detach().view(
+                -1)[0].item())
         base_gate_logit_bias: float = time_bias + base_bias  # 보통 -6.0
 
         self.pram_v2_block_path_scalars = PRAMV2BlockPathScalars(
@@ -2827,8 +2810,8 @@ class DiT(nn.Module):
                                 dtype=torch.float32)  # (3,)
 
         # (B,P)
-        bias_bp: torch.Tensor = (type_one_hot * bias_vec.view(1, 1, 3)).sum(
-            dim=-1)
+        bias_bp: torch.Tensor = (type_one_hot *
+                                 bias_vec.view(1, 1, 3)).sum(dim=-1)
 
         # (B*P)
         bias_flat: torch.Tensor = bias_bp.reshape(B * P)
@@ -2838,8 +2821,9 @@ class DiT(nn.Module):
         bias_packed: torch.Tensor = bias_flat.index_select(0, idx)  # (T,)
 
         # (1,1,T,1) + dtype/device 맞춤
-        bias_packed = bias_packed.view(1, 1, -1, 1).to(
-            device=reference_tensor.device, dtype=reference_tensor.dtype)
+        bias_packed = bias_packed.view(1, 1, -1,
+                                       1).to(device=reference_tensor.device,
+                                             dtype=reference_tensor.dtype)
         return bias_packed
 
     def _get_time_embedding(self, diffusion_time: torch.Tensor,
@@ -3549,15 +3533,13 @@ class DiT(nn.Module):
             )  # (1,1,T,1) or None
 
             # ---- SA/FFN은 기존과 동일, CA만 bias를 추가 ----
-            gate_sa = torch.sigmoid(
-                lg_time_p + k_g[:, 0:1] * lg_base_p + beta_g[
-                    :, 0:1])  # (depth,1,T,H)
-            gate_ffn = torch.sigmoid(
-                lg_time_p + k_g[:, 1:2] * lg_base_p + beta_g[
-                    :, 1:2])  # (depth,1,T,H)
+            gate_sa = torch.sigmoid(lg_time_p + k_g[:, 0:1] * lg_base_p +
+                                    beta_g[:, 0:1])  # (depth,1,T,H)
+            gate_ffn = torch.sigmoid(lg_time_p + k_g[:, 1:2] * lg_base_p +
+                                     beta_g[:, 1:2])  # (depth,1,T,H)
 
-            gate_ca_logit = (lg_time_p + k_g[:, 2:3] * lg_base_p + beta_g[
-                :, 2:3])  # (depth,1,T,H)
+            gate_ca_logit = (lg_time_p + k_g[:, 2:3] * lg_base_p +
+                             beta_g[:, 2:3])  # (depth,1,T,H)
             if ca_type_bias is not None:
                 gate_ca_logit = gate_ca_logit + ca_type_bias  # vehicle이면 더 큰 값
 
@@ -4186,11 +4168,11 @@ else
         ctrl_norm = target_current_control_norm.to(
             device=device, dtype=torch.float32)  # (B,Pnn,3)
         ctrl_norm_t = ctrl_norm.unsqueeze(2)  # (B,Pnn,1,3)
-        prev_valid_unsqueeze = prev_valid.unsqueeze(-1) # (B,Pnn,1)
+        prev_valid_unsqueeze = prev_valid.unsqueeze(-1)  # (B,Pnn,1)
 
         # state_normalizer.inverse는 (B,Pnn,T,3) 입력을 기대하므로 T=1로 맞춤
-        ctrl_unnorm_t = self.config.state_normalizer.inverse(ctrl_norm_t,
-                                                                   valid_mask=prev_valid_unsqueeze)
+        ctrl_unnorm_t = self.config.state_normalizer.inverse(
+            ctrl_norm_t, valid_mask=prev_valid_unsqueeze)
         ctrl_unnorm = ctrl_unnorm_t.squeeze(2)  # (B,Pnn,3)
         # 유효하지 않은 행은 0으로 (혹시라도 잘못 쓰여도 안전)
         ctrl_unnorm = ctrl_unnorm.masked_fill(~prev_valid.unsqueeze(-1), 0.0)
@@ -4340,9 +4322,8 @@ else
 
             # --- (3) 관측 정규화 → FeasibleProjector 네트워크(TCN) 보정 ---
             # (B, Pnn, segment_len_ds, 3)
-            seg_body_control_stride = self.config.state_normalizer(data=unnorm_seg_body_control_stride,
-                                                                   valid_mask=seg_valid
-                                                                   )
+            seg_body_control_stride = self.config.state_normalizer(
+                data=unnorm_seg_body_control_stride, valid_mask=seg_valid)
 
             with torch.autocast(
                     device_type=device_type,
@@ -4376,7 +4357,6 @@ else
                 data=seg_body_control_stride_ref,
                 valid_mask=seg_valid,
             )
-
 
             # --- (4) 미래 구간 제어만 원래 future_len 개수로 업샘플링 --- (여기서 과거 걸 짜르는듯)
             # (B, Pnn, future_len, 3)
@@ -4418,14 +4398,16 @@ else
                                                           1:]  # (B, Pnn, future_len) bool
             # target_cur_future_valid: (B, Pnn, 1+future_len) # 앞뒤 점이 모두 유호이면 유효
             # target_segment_valid : (B, Pnn, future_len)
-            target_segment_valid = target_cur_future_valid[:, :, 1:] & target_cur_future_valid[:, :, :-1]
+            target_segment_valid = target_cur_future_valid[:, :,
+                                                           1:] & target_cur_future_valid[:, :, :
+                                                                                         -1]
             integrated_trajectory = self.config.state_normalizer(
                 data=unnorm_integrated_trajectory,
                 valid_mask=target_future_valid)  # (B, Pnn, future_len, 4)
 
             # (B, Pnn, future_len, 3)
-            control_constraint_diff = self.config.state_normalizer(unnorm_control_constraint_diff,
-                                                                  valid_mask=target_segment_valid)
+            control_constraint_diff = self.config.state_normalizer(
+                unnorm_control_constraint_diff, valid_mask=target_segment_valid)
             control_constraint_diff = control_constraint_diff.masked_fill(
                 ~target_segment_valid.unsqueeze(-1), 0.0)
 
@@ -4469,13 +4451,15 @@ else
             )  # (B,Pnn,4)
             # target_cur_future_valid: (B,Pnn,1+T)
             # target_seg_future_valid : (B,Pnn,T)
-            target_seg_future_valid = target_cur_future_valid[:, :, 1:] & target_cur_future_valid[:, :, :-1]
+            target_seg_future_valid = target_cur_future_valid[:, :,
+                                                              1:] & target_cur_future_valid[:, :, :
+                                                                                            -1]
             # 미래 control unnorm
             # (B,Pnn,T,3)
-            unnorm_diffusion_control_traj = self.config.state_normalizer.inverse(data=diffusion_control_traj,
-                                                                valid_mask=target_seg_future_valid,
-                                                                                 )
-
+            unnorm_diffusion_control_traj = self.config.state_normalizer.inverse(
+                data=diffusion_control_traj,
+                valid_mask=target_seg_future_valid,
+            )
 
             # ✅ (1) prev control을 unnorm으로 변환 + ✅ (2) prev_valid 계산
             unnorm_prev_control, prev_control_valid = self._prepare_prev_control_for_filter_and_integrate(
@@ -4513,13 +4497,14 @@ else
                 valid_mask=target_future_valid,
             )
 
-            control_constraint_diff = self.config.state_normalizer(unnorm_control_constraint_diff,
-                                                                   valid_mask=target_seg_future_valid)
+            control_constraint_diff = self.config.state_normalizer(
+                unnorm_control_constraint_diff,
+                valid_mask=target_seg_future_valid)
             control_constraint_diff = control_constraint_diff.masked_fill(
                 ~target_seg_future_valid.unsqueeze(-1), 0.0)
 
-            norm_control_sequence = self.config.state_normalizer(unnorm_control_sequence
-                                                                 ,valid_mask=target_seg_future_valid) #
+            norm_control_sequence = self.config.state_normalizer(
+                unnorm_control_sequence, valid_mask=target_seg_future_valid)  #
             norm_control_sequence = norm_control_sequence.masked_fill(
                 ~target_seg_future_valid.unsqueeze(-1), 0.0)
 
