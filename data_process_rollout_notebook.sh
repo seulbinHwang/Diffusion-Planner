@@ -183,13 +183,13 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_deepspeed True \
   --save_image True \
   --save_video False \
-  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0303" \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0304" \
   --save_inference_data False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --fine_tune_gen_k 128 \
   --rollout_time_chunk_size 1 \
-  --fine_tune_temperature 0.8 \
+  --fine_tune_temperature 0.5 \
   --use_recovery False \
   --select_jointly True \
   --recovery_threshold_m 1.0 \

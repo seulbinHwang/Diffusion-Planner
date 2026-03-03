@@ -258,7 +258,7 @@ class DrawingOptions:
     EGO_radius_circle_line_width: float = 0.8  # 원 테두리 두께
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    EGO_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_draw_diffusion: bool = True
@@ -353,7 +353,7 @@ class DrawingOptions:
     DIFF_future_gt_3_dim_COLOR: str = DARK_BROWN  # 미래 포인트 'x' 마커 크기
 
     # NEW: GT 3차원 궤적 그리기 모드 ("point" / "line" / "arrow")
-    DIFF_future_gt_3_dim_draw_mode: str = "point"
+    DIFF_future_gt_3_dim_draw_mode: str = "line"
     DIFF_future_gt_3_dim_line_width: float = 0.4
     DIFF_future_gt_3_dim_arrow_len_m: float = 1.0
 
@@ -371,7 +371,7 @@ class DrawingOptions:
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    DIFF_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
@@ -389,7 +389,7 @@ class DrawingOptions:
     DIFF_future_int_style = {
         "line_color": LIGHTBLUE,  # 빨간색(밝은 빨강)
         "token_color": LIGHTBLUE,  # 빨간색(밝은 빨강)
-        "line_width": 0.8,
+        "line_width": 3.,
         "velocity_line_color": LIGHTBLUE,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
