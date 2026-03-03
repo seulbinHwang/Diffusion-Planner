@@ -2858,7 +2858,8 @@ def _predict_rollouts_batched_one_chunk(
                     base_seed=int(base_seed),
                     ddp_rank=int(ddp_rank),
                     pose_based=bool(pose_based_flag),
-                    noise_std=1.0,  # ✅ 표준정규 eps
+                    noise_std=float(getattr(args, "eval_temperature", 0.5)),
+                    # ✅ 변경: 1.0 -> eval_temperature
                 )
 
             # (A) 첫 스텝(step_start==0) 또는 non-amortized에서는 inference_noise를 넣음
@@ -2915,7 +2916,12 @@ def _predict_rollouts_batched_one_chunk(
             norm_inputs_b_r_copy["inference_noise"] = inference_noise
             norm_inputs_b_r_copy[
                 "amortized_random_noise"] = amortized_random_noise
-
+            # step_start==0일 때만: warm-up full은 amortized_random_noise로,
+            # shift에 쓸 tail은 별도 키로 같이 넣기
+            if use_amortized and int(step_start) == 0:
+                # bank: (B*R, A, 2T, D)
+                norm_inputs_b_r_copy["amortized_random_noise_tail"] = \
+                amortized_eps_bank[:, :, future_len:future_len + gap, :]
             norm_inputs_b_r_copy["rollout_time_chunk_size"] = torch.full(
                 (merged_batch,),
                 int(gap),
@@ -2978,6 +2984,8 @@ def _predict_rollouts_batched_one_chunk(
                     norm_inputs_for_draw = dict(norm_inputs_b_r_copy)
                     norm_inputs_for_draw.pop("inference_noise", None)
                     norm_inputs_for_draw.pop("amortized_random_noise", None)
+                    norm_inputs_for_draw.pop("amortized_random_noise_tail",
+                                             None)
                 """
                 unnorm_inputs_np: 그림용 입력 스냅샷(dict, 원래 단위, numpy 중심)
                 unnorm_trajectory_np: 모델 예측 궤적(원래 단위, numpy)

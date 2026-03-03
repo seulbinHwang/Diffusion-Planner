@@ -2477,16 +2477,6 @@ class Decoder(nn.Module):
                 rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
                 rollout_time_chunk_size_int = int(
                     rollout_time_chunk_size[0].item())
-
-                # ✅ cand_idx 기반 seed로 만든 랜덤을 inputs에서 받아 사용
-                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
-                amortized_random_noise = self._get_amortized_random_noise_from_inputs(
-                    inputs=inputs,
-                    batch_size=int(B),
-                    one_or_Pnn=int(one_or_Pnn),
-                    target_current_xyyaw=target_current_xyyaw,
-                )
-
                 # target_future_valid: (B, (1+)Pnn, T)
                 target_future_valid = target_past_cur_future_valid[:, :, -self.
                                                                    _future_len:].detach(
@@ -2498,7 +2488,19 @@ class Decoder(nn.Module):
                         rollout_time_chunk_size=rollout_time_chunk_size_int,
                         target_future_valid=target_future_valid,
                     )
-
+                tail = inputs.get("amortized_random_noise_tail", None)
+                if (inputs.get("inference_noise",
+                               None) is not None) and isinstance(tail,
+                                                                 torch.Tensor):
+                    amortized_random_noise = _ensure_tensor_on_ref(tail,
+                                                                   target_current_xyyaw)
+                else:
+                    amortized_random_noise = self._get_amortized_random_noise_from_inputs(
+                        inputs=inputs,
+                        batch_size=int(B),
+                        one_or_Pnn=int(one_or_Pnn),
+                        target_current_xyyaw=target_current_xyyaw,
+                    )
                 # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
                 self._set_amortized_buffer_from_sequence(
                     diffusion_future_sequence=

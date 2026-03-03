@@ -5111,6 +5111,143 @@ def _transform_pose_4_dim_inplace(
     pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
 
 
+
+def _enforce_unit_cos_sin_in_state_11_inplace(
+    state_11: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> None:
+    """state_11 안의 (cos, sin)을 유효 마스크 기준으로 “정상 형태”로 정리합니다.
+
+    목표
+    ----
+    - valid_mask=True 인 칸:
+        - (cos, sin)의 길이를 1로 맞춥니다.
+        - 길이가 너무 작으면(거의 0이면) 유효 칸에 한해서만 (1, 0)으로 둡니다.
+    - valid_mask=False 인 칸:
+        - (cos, sin)을 반드시 (0, 0)으로 유지합니다.
+
+    Args:
+        state_11 (torch.Tensor):
+            상태 텐서.
+            shape: (..., 11)
+            - state_11[..., 2] = cos
+            - state_11[..., 3] = sin
+        valid_mask (torch.Tensor):
+            유효 마스크.
+            shape: state_11.shape[:-1]
+            dtype: bool 또는 0/1 또는 float 등 (0이 아니면 True로 처리)
+        eps (float):
+            0으로 나누는 문제를 피하기 위한 작은 값. shape: ()
+
+    Returns:
+        None
+    """
+    if not isinstance(state_11, torch.Tensor):
+        raise TypeError("state_11은 torch.Tensor여야 합니다.")
+    if state_11.dim() < 1 or int(state_11.shape[-1]) != 11:
+        raise ValueError(
+            "state_11은 (..., 11) 형태여야 합니다. "
+            f"got shape={tuple(state_11.shape)}"
+        )
+    if not isinstance(valid_mask, torch.Tensor):
+        raise TypeError("valid_mask는 torch.Tensor여야 합니다.")
+
+    expected_mask_shape = tuple(int(x) for x in state_11.shape[:-1])
+    got_mask_shape = tuple(int(x) for x in valid_mask.shape)
+    if got_mask_shape != expected_mask_shape:
+        raise ValueError(
+            "valid_mask shape가 state_11과 맞지 않습니다. "
+            f"expected={expected_mask_shape}, got={got_mask_shape}"
+        )
+
+    # valid_mask -> bool (0이 아니면 True)
+    if valid_mask.dtype == torch.bool:
+        vm = valid_mask
+    else:
+        vm = (valid_mask != 0)
+    vm = vm.to(device=state_11.device, dtype=torch.bool)
+
+    # (cos, sin)만 float32로 계산해서 안정적으로 정리 후 원래 dtype으로 되돌림
+    cos_v_f = state_11[..., 2].to(dtype=torch.float32)
+    sin_v_f = state_11[..., 3].to(dtype=torch.float32)
+
+    raw_norm = torch.sqrt(cos_v_f * cos_v_f + sin_v_f * sin_v_f)  # shape: (...)
+    safe_norm = torch.clamp(raw_norm, min=float(eps))
+
+    cos_n_f = cos_v_f / safe_norm
+    sin_n_f = sin_v_f / safe_norm
+
+    # valid인데 길이가 거의 0이면 유효 칸에 한해 (1,0)
+    too_small = raw_norm < float(eps)
+    cos_n_f = torch.where(too_small, torch.ones_like(cos_n_f), cos_n_f)
+    sin_n_f = torch.where(too_small, torch.zeros_like(sin_n_f), sin_n_f)
+
+    cos_n = cos_n_f.to(dtype=state_11.dtype)
+    sin_n = sin_n_f.to(dtype=state_11.dtype)
+
+    # ✅ 유효/무효 분리:
+    # - valid(True): 정리된 값
+    # - invalid(False): (0,0)
+    zero = torch.zeros_like(cos_n)
+    state_11[..., 2] = torch.where(vm, cos_n, zero)
+    state_11[..., 3] = torch.where(vm, sin_n, zero)
+
+
+def _enforce_unit_cos_sin_in_past_inputs_inplace(
+    unnorm_inputs_copy: Dict[str, Any],
+    eps: float = 1e-8,
+) -> None:
+    """모델 입력으로 들어갈 past들의 (cos, sin)을 “forward 직전”에 한 번 더 정리합니다.
+
+    대상(키가 존재할 때만 처리)
+    --------------------------
+    - ego_agent_past            + ego_agent_past_is_valid
+      - ego_agent_past shape: (B, T_past, 11)
+      - valid shape:          (B, T_past)
+    - near_agents_past          + near_agents_past_is_valid
+      - near_agents_past shape: (B, Pnn, T_past, 11)
+      - valid shape:           (B, Pnn, T_past)
+    - (있다면) neighbor_agents_past + neighbor_agents_past_is_valid
+    - (있다면) non_near_agents_past + non_near_agents_past_is_valid
+
+    Args:
+        unnorm_inputs_copy (Dict[str, Any]):
+            rollout 중 계속 갱신되는 unnorm 입력 dict.
+        eps (float):
+            0 나눗셈 방지용 작은 값. shape: ()
+
+    Returns:
+        None
+    """
+    if not isinstance(unnorm_inputs_copy, dict):
+        raise TypeError("unnorm_inputs_copy는 dict여야 합니다.")
+
+    targets = [
+        ("ego_agent_past", "ego_agent_past_is_valid"),
+        ("near_agents_past", "near_agents_past_is_valid"),
+        ("neighbor_agents_past", "neighbor_agents_past_is_valid"),
+        ("non_near_agents_past", "non_near_agents_past_is_valid"),
+    ]
+
+    for state_key, valid_key in targets:
+        state = unnorm_inputs_copy.get(state_key, None)
+        valid = unnorm_inputs_copy.get(valid_key, None)
+
+        # 키가 없거나 None이면 스킵(옵션 키 대응)
+        if state is None or valid is None:
+            continue
+        if not isinstance(state, torch.Tensor) or state.numel() == 0:
+            continue
+        if not isinstance(valid, torch.Tensor) or valid.numel() == 0:
+            continue
+
+        _enforce_unit_cos_sin_in_state_11_inplace(
+            state_11=state,
+            valid_mask=valid,
+            eps=float(eps),
+        )
+
 def _build_norm_inputs_from_unnorm_inputs(
     unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
@@ -5130,6 +5267,11 @@ def _build_norm_inputs_from_unnorm_inputs(
         Dict[str, Any]:
             정규화된 입력 dict(모델 forward에 넣을 dict).
     """
+    # ✅ (추가) 다음 forward 직전: past의 (cos,sin)을 유효/무효 기준으로 정리
+    _enforce_unit_cos_sin_in_past_inputs_inplace(
+        unnorm_inputs_copy=unnorm_inputs_copy,
+        eps=1e-8,
+    )
     norm_inputs_step: Dict[str,
                            Any] = observation_normalizer(unnorm_inputs_copy)
     norm_outputs_step = {k: v.clone() for k, v in unnorm_outputs_copy.items()}
