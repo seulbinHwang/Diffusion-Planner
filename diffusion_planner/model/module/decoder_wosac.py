@@ -313,54 +313,87 @@ class Decoder(nn.Module):
         self.t_tau = torch.clamp(self.t_tau, max=t_max)  # (T,)
 
     def _get_amortized_random_noise_from_inputs(
-        self,
-        inputs: Dict[str, torch.Tensor],
-        batch_size: int,
-        one_or_Pnn: int,
-        target_current_xyyaw: torch.Tensor,
+            self,
+            inputs: Dict[str, torch.Tensor],
+            batch_size: int,
+            one_or_Pnn: int,
+            target_current_xyyaw: torch.Tensor,
     ) -> torch.Tensor:
-        """amortized + step_idx>0에서 사용할 랜덤 텐서를 inputs에서 꺼냅니다.
+        """amortized에서 사용할 표준정규 노이즈(eps)를 inputs에서 꺼냅니다.
 
-        이 랜덤은 Decoder가 기존에 torch.randn_like(...)로 만들던 값(표준정규)을
-        바깥(eval 코드)에서 cand_idx 기반 seed로 만든 뒤 전달받는 용도입니다.
+        허용 shape
+        ----------
+        - step=0 (warm-up 포함): (B, (1+)Pnn, future_len, D)
+        - step>0 (AR 업데이트):  (B, (1+)Pnn, gap, D)
+          - gap은 inputs["rollout_time_chunk_size"](스칼라/배치 텐서)에서 읽습니다.
 
         Args:
             inputs (Dict[str, torch.Tensor]):
-                모델 입력 dict.
-                - amortized_random_noise: (B, (1+)Pnn, future_len, 4 or 3)
-            batch_size (int):
-                B
-            one_or_Pnn (int):
-                (1+Pnn)
+                - amortized_random_noise:
+                    - (B, (1+)Pnn, future_len, D) 또는 (B, (1+)Pnn, gap, D)
+                - rollout_time_chunk_size (선택):
+                    - shape: (B,) 또는 () 또는 임의(원소 1개 이상)
+                    - 값: gap
+            batch_size (int): B
+            one_or_Pnn (int): (1+Pnn)
             target_current_xyyaw (torch.Tensor):
                 dtype/device 기준 텐서.
                 shape: (B, (1+)Pnn, 4)
 
         Returns:
             torch.Tensor:
-                amortized random noise 텐서.
-                shape: (B, (1+)Pnn, future_len, 4 or 3)
+                - (B, (1+)Pnn, future_len, D) 또는 (B, (1+)Pnn, gap, D)
+                - device는 target_current_xyyaw.device로 맞춰 반환
         """
         noise = inputs.get("amortized_random_noise", None)
         if noise is None:
             raise KeyError(
-                "amortized(step_idx>0) 추론에는 inputs['amortized_random_noise']가 필요합니다. "
-                "eval 코드에서 cand_idx 기반 seed로 만든 텐서를 넣어 주세요.")
+                "amortized 추론에는 inputs['amortized_random_noise']가 필요합니다."
+            )
         if not isinstance(noise, torch.Tensor):
             raise TypeError(
                 "inputs['amortized_random_noise']는 torch.Tensor여야 합니다.")
-        if self.config.pose_based:
-            expected_dim = 4
-        else:
-            expected_dim = 3
-        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len),
-                    expected_dim)
-        if tuple(noise.shape) != expected:
+
+        expected_dim = 4 if bool(self.config.pose_based) else 3
+        future_len = int(self._future_len)
+
+        # 1) 전체(T) 노이즈: (B, A, T, D)
+        full_expected = (int(batch_size), int(one_or_Pnn), int(future_len),
+                         int(expected_dim))
+        if tuple(noise.shape) == full_expected:
+            return _ensure_tensor_on_ref(noise, target_current_xyyaw)
+
+        # 2) tail(gap) 노이즈: (B, A, gap, D)
+        gap_val: Optional[int] = None
+        rts = inputs.get("rollout_time_chunk_size", None)
+        if isinstance(rts, torch.Tensor) and rts.numel() > 0:
+            try:
+                gap_val = int(rts.reshape(-1)[0].item())
+            except Exception:
+                gap_val = None
+
+        if gap_val is None:
+            raise ValueError(
+                "inputs['amortized_random_noise']가 (B,A,T,D)가 아닌데, "
+                "gap을 알 수 없어 (B,A,gap,D)로도 검증할 수 없습니다. "
+                "inputs['rollout_time_chunk_size']를 확인해 주세요."
+            )
+
+        gap = int(max(0, min(int(gap_val), int(future_len))))
+        if gap <= 0:
+            raise ValueError(
+                f"rollout_time_chunk_size(gap)는 1 이상이어야 합니다. gap={gap}")
+
+        tail_expected = (int(batch_size), int(one_or_Pnn), int(gap),
+                         int(expected_dim))
+        if tuple(noise.shape) != tail_expected:
             raise ValueError(
                 "inputs['amortized_random_noise'] shape가 예상과 다릅니다. "
-                f"expected={expected}, got={tuple(noise.shape)}")
+                f"expected (full)={full_expected} 또는 (tail)={tail_expected}, got={tuple(noise.shape)}"
+            )
 
         return _ensure_tensor_on_ref(noise, target_current_xyyaw)
+
 
     def _get_inference_noise_from_inputs(
         self,
@@ -1818,15 +1851,13 @@ class Decoder(nn.Module):
 
         return decoder_output_dict
 
-    # =========================================================
-    # 3) Decoder._set_amortized_buffer_from_sequence 를 교체
-    # =========================================================
     def _set_amortized_buffer_from_sequence(
             self,
             diffusion_future_sequence: torch.Tensor,
             # (B, (1+)Pnn, future_len, 4 or 3)  == "x0" 역할
             random_noise: torch.Tensor,
-            # (B, (1+)Pnn, future_len, 4 or 3)  == "새로 받은 eps 후보(전체 T)"  (do_shift=True면 tail만 사용)
+            # do_shift=False: (B, (1+)Pnn, future_len, D) 필요
+            # do_shift=True : (B, (1+)Pnn, future_len, D) 또는 (B, (1+)Pnn, gap, D)
             rollout_time_chunk_size: Optional[int] = None,
             do_shift: bool = True,
     ) -> None:
@@ -1835,28 +1866,25 @@ class Decoder(nn.Module):
         핵심 동작
         ----------
         - Warm-up(do_shift=False):
-          - eps 전체(T칸)를 1번 저장합니다.
-          - z = alpha(t_tau) * x0 + sigma(t_tau) * eps 로 만들어 self._amortized_buffer(z)에 저장합니다.
+          - eps는 반드시 전체(T) 길이로 들어와야 합니다.
+          - z = alpha(t_tau) * x0 + sigma(t_tau) * eps
         - AR 업데이트(do_shift=True):
-          - x0도 gap만큼 shift합니다.
-          - eps도 "기존 eps 버퍼"를 gap만큼 shift합니다.
-          - 새로 생긴 tail(gap칸)만 random_noise의 tail을 사용해 eps를 채웁니다.
-          - z는 전체 T칸을 한 번에 다시 계산합니다.
-          - self._amortized_buffer(z)와 self._amortized_buffer_eps(eps)를 같이 갱신합니다.
+          - x0는 gap만큼 shift
+          - eps는 기존 eps 버퍼를 gap만큼 shift
+          - 새로 생긴 tail(gap칸)만 새 eps로 채움
+            - random_noise가 (B,P,T,D)이면: tail을 슬라이스해서 사용
+            - random_noise가 (B,P,gap,D)이면: 그대로 tail에 사용
 
         Args:
             diffusion_future_sequence (torch.Tensor):
-                x0 역할 텐서.
-                shape: (B, (1+)Pnn, future_len, C)  C=4(pose) 또는 3(control)
+                shape: (B, (1+)Pnn, future_len, D)
             random_noise (torch.Tensor):
-                표준정규 노이즈(eps) 텐서.
-                shape: (B, (1+)Pnn, future_len, C)
-                - do_shift=True일 때는 tail(gap) 구간만 사용합니다.
+                - do_shift=False: (B, (1+)Pnn, future_len, D)
+                - do_shift=True : (B, (1+)Pnn, future_len, D) 또는 (B, (1+)Pnn, gap, D)
             rollout_time_chunk_size (Optional[int]):
-                gap. do_shift=True일 때만 필요합니다.
+                do_shift=True일 때 gap 값.
             do_shift (bool):
-                True면 AR 업데이트(shift + tail append),
-                False면 warm-up(전체 eps 저장) 입니다.
+                True면 AR 업데이트, False면 warm-up
 
         Returns:
             None
@@ -1864,15 +1892,59 @@ class Decoder(nn.Module):
         if not isinstance(random_noise, torch.Tensor):
             raise TypeError("random_noise must be torch.Tensor.")
 
-        if tuple(random_noise.shape) != tuple(diffusion_future_sequence.shape):
+        if diffusion_future_sequence.dim() != 4:
             raise ValueError(
-                "random_noise shape가 diffusion_future_sequence와 같아야 합니다. "
-                f"random_noise={tuple(random_noise.shape)}, "
-                f"diffusion_future_sequence={tuple(diffusion_future_sequence.shape)}"
+                "diffusion_future_sequence는 (B, (1+)Pnn, T, D) 4D여야 합니다. "
+                f"got shape={tuple(diffusion_future_sequence.shape)}"
             )
 
         B = int(diffusion_future_sequence.shape[0])
+        P = int(diffusion_future_sequence.shape[1])
         future_len = int(diffusion_future_sequence.shape[2])
+        D = int(diffusion_future_sequence.shape[3])
+
+        full_expected = (B, P, future_len, D)
+
+        # dtype/device는 diffusion_future_sequence 기준으로만 맞춤 (이미 같으면 no-op)
+        if random_noise.device != diffusion_future_sequence.device or random_noise.dtype != diffusion_future_sequence.dtype:
+            random_noise = random_noise.to(
+                device=diffusion_future_sequence.device,
+                dtype=diffusion_future_sequence.dtype,
+            )
+
+        if not do_shift:
+            # warm-up은 반드시 전체(T) eps가 필요
+            if tuple(random_noise.shape) != full_expected:
+                raise ValueError(
+                    "warm-up(do_shift=False)에서는 random_noise가 diffusion_future_sequence와 같은 shape여야 합니다. "
+                    f"expected={full_expected}, got={tuple(random_noise.shape)}"
+                )
+            noise_mode = "full"
+            gap = 0
+        else:
+            if rollout_time_chunk_size is None:
+                raise ValueError(
+                    "do_shift=True 인데 rollout_time_chunk_size(gap)가 없습니다.")
+            gap = int(
+                max(0, min(int(rollout_time_chunk_size), int(future_len))))
+
+            # gap==0이면 eps/x0를 그대로 유지하는 편이 안전
+            if gap == 0:
+                noise_mode = "none"
+            else:
+                tail_expected = (B, P, gap, D)
+
+                if tuple(random_noise.shape) == full_expected:
+                    noise_mode = "full"
+                elif tuple(random_noise.shape) == tail_expected:
+                    noise_mode = "tail"
+                else:
+                    raise ValueError(
+                        "do_shift=True에서 random_noise shape는 "
+                        f"(full)={full_expected} 또는 (tail)={tail_expected} 여야 합니다. "
+                        f"got={tuple(random_noise.shape)}"
+                    )
+
         device_type = diffusion_future_sequence.device.type
 
         # t_tau: (B, future_len)
@@ -1885,20 +1957,15 @@ class Decoder(nn.Module):
         # (A) x0 shift 준비
         # -------------------------
         if do_shift:
-            assert rollout_time_chunk_size is not None, "rollout_time_chunk_size must be set when do_shift=True."
-            gap = int(rollout_time_chunk_size)
-            gap = max(0, min(gap, future_len))
-
             x0_shifted = torch.zeros_like(
-                diffusion_future_sequence)  # (B,P,T,C)
+                diffusion_future_sequence)  # (B,P,T,D)
             if gap > 0 and gap < future_len:
                 x0_shifted[:, :, :future_len - gap, :] = \
                 diffusion_future_sequence[:, :, gap:, :]
             elif gap == 0:
                 x0_shifted = diffusion_future_sequence
-            # gap == future_len 이면 전부 0 유지
+            # gap == future_len이면 전부 0 유지
         else:
-            gap = 0
             x0_shifted = diffusion_future_sequence
 
         # -------------------------
@@ -1910,12 +1977,10 @@ class Decoder(nn.Module):
                     "do_shift=True 인데 self._amortized_buffer_eps가 없습니다. "
                     "warm-up(do_shift=False)에서 eps 버퍼를 먼저 세팅해야 합니다."
                 )
-            if tuple(self._amortized_buffer_eps.shape) != tuple(
-                    diffusion_future_sequence.shape):
+            if tuple(self._amortized_buffer_eps.shape) != full_expected:
                 raise RuntimeError(
-                    "self._amortized_buffer_eps shape가 현재 diffusion_future_sequence와 다릅니다. "
-                    f"eps={tuple(self._amortized_buffer_eps.shape)}, "
-                    f"x0={tuple(diffusion_future_sequence.shape)}"
+                    "self._amortized_buffer_eps shape가 예상과 다릅니다. "
+                    f"expected={full_expected}, got={tuple(self._amortized_buffer_eps.shape)}"
                 )
 
             prev_eps = self._amortized_buffer_eps.to(
@@ -1923,34 +1988,35 @@ class Decoder(nn.Module):
                 dtype=diffusion_future_sequence.dtype,
             )
 
-            eps_shifted = torch.zeros_like(
-                diffusion_future_sequence)  # (B,P,T,C)
-
-            if gap > 0 and gap < future_len:
-                # 기존 eps를 앞으로 당김
-                eps_shifted[:, :, :future_len - gap, :] = prev_eps[
-                    :, :, gap:, :]
-                # tail(gap)만 새 eps로 채움 (random_noise의 tail만 사용)
-                eps_shifted[:, :, future_len - gap:, :] = random_noise[
-                    :, :, future_len - gap:, :]
-            elif gap == 0:
+            if gap == 0:
                 eps_shifted = prev_eps
             else:
-                # gap == future_len: 전부 새 tail(=전체)로
-                eps_shifted = random_noise.to(
-                    device=diffusion_future_sequence.device,
-                    dtype=diffusion_future_sequence.dtype,
-                )
+                eps_shifted = torch.zeros_like(
+                    diffusion_future_sequence)  # (B,P,T,D)
+
+                if gap < future_len:
+                    # 기존 eps를 앞으로 당김
+                    eps_shifted[:, :, :future_len - gap, :] = prev_eps[
+                        :, :, gap:, :]
+
+                    # 새 tail(gap) 채우기
+                    if noise_mode == "tail":
+                        tail_eps = random_noise  # (B,P,gap,D)
+                    else:
+                        # full -> tail slice
+                        tail_eps = random_noise[
+                            :, :, future_len - gap:, :]  # (B,P,gap,D)
+
+                    eps_shifted[:, :, future_len - gap:, :] = tail_eps
+                else:
+                    # gap == future_len: 전체를 새 eps로 교체
+                    eps_shifted = random_noise if noise_mode == "tail" else random_noise
         else:
             # warm-up: eps 전체를 그대로 저장
-            eps_shifted = random_noise.to(
-                device=diffusion_future_sequence.device,
-                dtype=diffusion_future_sequence.dtype,
-            )
+            eps_shifted = random_noise
 
         # -------------------------
-        # (C) z 재계산: z = alpha*x0 + sigma*eps
-        #     (계산은 fp32로)
+        # (C) z 재계산: z = alpha*x0 + sigma*eps (FP32)
         # -------------------------
         with torch.autocast(device_type=device_type, enabled=False):
             x0_f32 = x0_shifted.to(dtype=torch.float32)
@@ -1960,10 +2026,10 @@ class Decoder(nn.Module):
                                                        t_f32)  # mean=alpha*x0, std=sigma
             eps_f32 = eps_shifted.to(device=x0_f32.device, dtype=torch.float32)
 
-            z_f32 = mean_f32 + std_f32 * eps_f32  # (B,P,T,C)
+            z_f32 = mean_f32 + std_f32 * eps_f32  # (B,P,T,D)
 
         # -------------------------
-        # (D) 버퍼 갱신 (dtype/device는 x0 기준으로 맞춤)
+        # (D) 버퍼 갱신
         # -------------------------
         self._amortized_buffer = z_f32.to(
             device=diffusion_future_sequence.device,
