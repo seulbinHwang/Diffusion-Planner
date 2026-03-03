@@ -3539,6 +3539,129 @@ def _compute_inference_noise_bank_len(
     return int(s + t)
 
 
+
+def _get_or_build_inference_noise_bank_stack_for_candidate_range(
+    *,
+    bank_cache: Dict[int, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    one_or_pnn: int,
+    bank_len: int,
+    rollout_idx: int,
+    base_seed: int,
+    ddp_rank: int,
+    pose_based: bool,
+    noise_std: float,
+    seed_stride: int,
+    cand_start_idx: int,
+    cand_count: int,
+) -> torch.Tensor:
+    """cand 범위의 noise bank를 (K,B,1+Pnn,L,D)로 한 번에 쌓아 캐시합니다.
+
+    목적
+    ----
+    - 매 step마다 cand_count(K)번 슬라이스/스택을 반복하지 않고,
+      미리 (K,B,1+Pnn,L,D) 형태로 쌓아둔 bank_stack에서
+      한 번의 슬라이스로 (K,B,1+Pnn,T,D)를 얻기 위함입니다.
+    - 메모리를 아끼기 위해, bank_cache[cand_idx]는 bank_stack의 "뷰(view)"로 연결해 둡니다.
+      (따라서 bank_stack과 cand별 bank가 같은 데이터를 공유합니다.)
+
+    Args:
+        bank_cache (Dict[int, torch.Tensor]):
+            - cand_idx(>=0): (B, 1+Pnn, L, D) 뷰 또는 텐서
+            - stack_key(<0): (K, B, 1+Pnn, L, D) 스택 텐서
+            shape: ()
+        device (torch.device): 텐서를 둘 device. shape: ()
+        dtype (torch.dtype): 텐서 dtype. shape: ()
+        batch_size (int): B. shape: ()
+        one_or_pnn (int): (1+Pnn). shape: ()
+        bank_len (int): L. shape: ()
+        rollout_idx (int): rollout 인덱스. shape: ()
+        base_seed (int): 기본 seed. shape: ()
+        ddp_rank (int): DDP rank. shape: ()
+        pose_based (bool): True면 D=4, False면 D=3. shape: ()
+        noise_std (float): 노이즈 크기(표준편차). shape: ()
+        seed_stride (int): cand_idx별 seed 간격. shape: ()
+        cand_start_idx (int): cand 시작 인덱스. shape: ()
+        cand_count (int): cand 개수 K. shape: ()
+
+    Returns:
+        torch.Tensor:
+            bank_stack.
+            shape: (K, B, 1+Pnn, L, D)
+    """
+    b = int(max(1, int(batch_size)))
+    k = int(max(1, int(cand_count)))
+    p = int(one_or_pnn)
+    L = int(max(1, int(bank_len)))
+    d = 4 if bool(pose_based) else 3
+
+    # cand_start_idx에 따라 스택 캐시 키를 다르게(충돌 방지)
+    # cand_idx는 0 이상만 쓰므로, 음수 키는 안전한 "메타 캐시" 용도
+    stack_key = -1 - int(cand_start_idx)
+
+    expected_stack_shape = (k, b, p, L, d)
+
+    cached_stack = bank_cache.get(stack_key, None)
+    if isinstance(cached_stack, torch.Tensor) and tuple(int(x) for x in cached_stack.shape) == expected_stack_shape:
+        # device/dtype만 맞추고 반환
+        if cached_stack.device != device or cached_stack.dtype != dtype:
+            cached_stack = cached_stack.to(device=device, dtype=dtype)
+            bank_cache[stack_key] = cached_stack
+
+            # cand_idx -> view 재연결 (dtype/device 바뀌면 view도 다시 잡아야 안전)
+            for local_i in range(k):
+                cand_idx = int(cand_start_idx) + int(local_i)
+                bank_cache[cand_idx] = cached_stack[local_i]
+        return cached_stack
+
+    # 새로 생성: (K, B, 1+Pnn, L, D)
+    bank_stack = torch.empty(
+        (k, b, p, L, d),
+        device=device,
+        dtype=dtype,
+    )
+
+    for local_i in range(k):
+        cand_idx = int(cand_start_idx) + int(local_i)
+
+        # 이미 cand bank가 있으면 재사용(shape가 맞을 때만)
+        existing = bank_cache.get(cand_idx, None)
+        use_existing = (
+            isinstance(existing, torch.Tensor)
+            and tuple(int(x) for x in existing.shape) == (b, p, L, d)
+        )
+
+        if use_existing:
+            src = existing
+            if src.device != device or src.dtype != dtype:
+                src = src.to(device=device, dtype=dtype)
+            bank_stack[local_i].copy_(src)
+        else:
+            cand_base_seed = int(base_seed) + int(cand_idx) * int(seed_stride)
+            # ✅ step_idx=0 고정: "step에 무관한 긴 bank"를 만든다
+            noise_bank_i = _build_inference_noise_for_rollout_chunk(
+                device=device,
+                dtype=dtype,
+                batch_size=b,
+                one_or_pnn=p,
+                future_len=L,             # ✅ bank 길이
+                rollout_idx=int(rollout_idx),
+                base_seed=int(cand_base_seed),
+                ddp_rank=int(ddp_rank),
+                step_idx=0,               # ✅ step seed 제거
+                pose_based=bool(pose_based),
+                noise_std=float(noise_std),
+            )
+            bank_stack[local_i].copy_(noise_bank_i)
+
+        # ✅ cand_idx 엔트리는 bank_stack의 view로 연결(메모리 중복 방지)
+        bank_cache[cand_idx] = bank_stack[local_i]
+
+    bank_cache[stack_key] = bank_stack
+    return bank_stack
+
 def _get_or_build_inference_noise_bank_for_candidate(
     *,
     bank_cache: Dict[int, torch.Tensor],
@@ -3644,32 +3767,28 @@ def _build_inference_noise_flat_from_bank_for_candidate_range(
     cand_start_idx: int,
     cand_count: int,
 ) -> torch.Tensor:
-    """noise bank에서 step_idx 위치로 잘라 후보 묶음의 inference_noise_flat을 만듭니다.
+    """noise bank 스택에서 한 번의 슬라이스로 inference_noise_flat을 만듭니다.
 
-    Args:
-        bank_cache (Dict[int, torch.Tensor]): cand_idx -> bank 캐시. shape: ()
-        device/dtype: model 입력과 맞출 값. shape: ()
-        batch_size (int): B. shape: ()
-        one_or_pnn (int): (1+Pnn). shape: ()
-        future_len (int): 매 step에서 필요한 길이 T. shape: ()
-        bank_len (int): bank 길이 L. shape: ()
-        rollout_idx/base_seed/ddp_rank/seed_stride/cand_*: bank 생성용. shape: ()
-        step_idx (int): 현재 step_start(슬라이스 시작점). shape: ()
-        pose_based (bool): last_dim 결정. shape: ()
-        noise_std (float): 노이즈 크기. shape: ()
+    핵심
+    ----
+    - 이 함수 안에서는 cand loop를 돌지 않습니다.
+    - (K,B,1+Pnn,L,D) bank_stack을 준비한 뒤,
+      bank_stack[..., step_idx:step_idx+T, :] 한 번으로 (K,B,1+Pnn,T,D)를 얻습니다.
 
     Returns:
         torch.Tensor:
-            inference_noise_flat
+            inference_noise_flat.
             shape:
-              - pose_based=True  -> (B*cand_count, 1+Pnn, future_len, 4)
-              - pose_based=False -> (B*cand_count, 1+Pnn, future_len, 3)
+              - pose_based=True  -> (B*K, 1+Pnn, T, 4)
+              - pose_based=False -> (B*K, 1+Pnn, T, 3)
     """
     b = int(max(1, int(batch_size)))
-    c = int(max(1, int(cand_count)))
+    k = int(max(1, int(cand_count)))
+    p = int(one_or_pnn)
     t = int(max(1, int(future_len)))
     s = int(max(0, int(step_idx)))
     L = int(max(1, int(bank_len)))
+    d = 4 if bool(pose_based) else 3
 
     if s + t > L:
         raise ValueError(
@@ -3678,39 +3797,29 @@ def _build_inference_noise_flat_from_bank_for_candidate_range(
             "bank_len은 최소 scenario_finish_step + future_len 이어야 합니다."
         )
 
-    last_dim = 4 if bool(pose_based) else 3
+    # ✅ (K,B,1+Pnn,L,D) 준비 (없으면 여기서 1번만 생성)
+    bank_stack = _get_or_build_inference_noise_bank_stack_for_candidate_range(
+        bank_cache=bank_cache,
+        device=device,
+        dtype=dtype,
+        batch_size=b,
+        one_or_pnn=p,
+        bank_len=L,
+        rollout_idx=int(rollout_idx),
+        base_seed=int(base_seed),
+        ddp_rank=int(ddp_rank),
+        pose_based=bool(pose_based),
+        noise_std=float(noise_std),
+        seed_stride=int(seed_stride),
+        cand_start_idx=int(cand_start_idx),
+        cand_count=int(k),
+    )  # shape: (K, B, 1+Pnn, L, D)
 
-    noises = []
-    for local_i in range(c):
-        cand_idx = int(cand_start_idx) + int(local_i)
-        bank = _get_or_build_inference_noise_bank_for_candidate(
-            bank_cache=bank_cache,
-            device=device,
-            dtype=dtype,
-            batch_size=b,
-            one_or_pnn=int(one_or_pnn),
-            bank_len=L,
-            rollout_idx=int(rollout_idx),
-            base_seed=int(base_seed),
-            ddp_rank=int(ddp_rank),
-            pose_based=bool(pose_based),
-            noise_std=float(noise_std),
-            seed_stride=int(seed_stride),
-            cand_idx=int(cand_idx),
-        )
-        # slice: (B, 1+Pnn, future_len, last_dim)
-        noises.append(bank[:, :, s:s + t, :])
+    # ✅ 배치 슬라이스: (K, B, 1+Pnn, T, D)
+    noise_chunk = bank_stack[:, :, :, s:s + t, :]
 
-    # (cand_count, B, 1+Pnn, future_len, last_dim)
-    noise_stack = torch.stack(noises, dim=0)
-
-    # (cand_count*B, 1+Pnn, future_len, last_dim)
-    noise_flat = noise_stack.reshape(
-        int(c) * int(b),
-        int(one_or_pnn),
-        int(t),
-        int(last_dim),
-    )
+    # ✅ (K*B, 1+Pnn, T, D)
+    noise_flat = noise_chunk.reshape(int(k) * int(b), int(p), int(t), int(d))
     return noise_flat.contiguous()
 
 def _build_inference_noise_batch_for_candidate_range(

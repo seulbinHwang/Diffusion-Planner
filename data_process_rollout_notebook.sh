@@ -177,26 +177,26 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --profile_feasible False \
   --use_feasible True \
   --use_feasible_dl False \
-  --use_feasible_filter True \
+  --use_feasible_filter False \
   --feasible_grad_to_dit False \
   --use_wandb False \
   --use_deepspeed True \
-  --save_image False \
+  --save_image True \
   --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0303" \
-  --save_inference_data True \
+  --save_inference_data False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
-  --fine_tune_gen_k 64 \
+  --fine_tune_gen_k 128 \
   --rollout_time_chunk_size 1 \
   --fine_tune_temperature 0.8 \
-  --use_recovery True \
+  --use_recovery False \
   --select_jointly True \
   --recovery_threshold_m 1.0 \
-  --scenario_finish_step 10 \
+  --scenario_finish_step 1 \
   --time_step_for_compare 80 \
   --time_step_for_recover 10 \
   --rollout_number 1 \
   --use_amortized_diffusion False \
-  --move_by_recovery True \
+  --move_by_recovery False \
   --verbose True

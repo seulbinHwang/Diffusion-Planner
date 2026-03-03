@@ -364,7 +364,7 @@ def get_args():
     parser.add_argument(
         "--move_by_recovery",
         type=boolean,
-        default=True,
+        default=False,
         help="True면 rollout에서 실제 이동(execute)도 recovery 적용 후 궤적으로 진행합니다.",
     )
     parser.add_argument('--train_epochs',
