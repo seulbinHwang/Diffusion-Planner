@@ -14,6 +14,63 @@ except Exception:
 import torch
 from typing import Any, Optional
 
+def _pick_normalization_file_path(args_dict: dict[str, Any]) -> str:
+    """args_dict를 보고 사용할 normalization json 경로를 결정합니다.
+
+    Args:
+        args_dict (dict[str, Any]): 설정 dict.
+            - use_body_vel: body 좌표 속도 사용 여부(True/False 또는 "true"/"false" 등 문자열 가능)
+            - normalization_file_path: 사용자가 직접 지정한 json 경로(선택)
+
+    Returns:
+        str: 선택된 normalization json 경로 문자열.
+
+    Notes:
+        - use_body_vel == True  -> "normalization_use_body_vel.json"
+        - use_body_vel == False -> "normalization.json"
+        - normalization_file_path 가 위 두 기본 파일명 중 하나를 가리키면(use_body_vel 규칙을 적용).
+        - normalization_file_path가 "다른 파일"이면 그 값을 그대로 사용합니다.
+    """
+    raw_flag = args_dict.get("use_body_vel", False)
+
+    # 문자열/숫자도 안전하게 bool로 해석
+    if isinstance(raw_flag, bool):
+        use_body_vel = raw_flag
+    elif isinstance(raw_flag, (int, float)):
+        use_body_vel = (raw_flag != 0)
+    elif isinstance(raw_flag, str):
+        s = raw_flag.strip().lower()
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            use_body_vel = True
+        elif s in ("0", "false", "f", "no", "n", "off"):
+            use_body_vel = False
+        else:
+            use_body_vel = False
+    else:
+        use_body_vel = bool(raw_flag)
+
+    desired = "normalization_use_body_vel.json" if use_body_vel else "normalization.json"
+
+    given = args_dict.get("normalization_file_path", None)
+    if given is None:
+        return desired
+
+    given_str = str(given).strip()
+    if given_str == "":
+        return desired
+
+    # normalization_file_path가 "기본 두 파일" 중 하나면 use_body_vel 규칙을 우선
+    try:
+        given_name = Path(given_str).name
+    except Exception:
+        given_name = given_str
+
+    if given_name in ("normalization.json", "normalization_use_body_vel.json"):
+        return desired
+
+    # 그 외엔 사용자가 지정한 경로를 존중
+    return given_str
+
 class StateNormalizer:
     """입력 텐서의 마지막 차원에 따라 정규화/역정규화를 수행하는 클래스입니다.
 
@@ -57,7 +114,7 @@ class StateNormalizer:
 
     @classmethod
     def from_json2(cls, args_dict) -> "StateNormalizer":
-        path_str = args_dict.get("normalization_file_path", "normalization.json")
+        path_str = _pick_normalization_file_path(args_dict)
         data = openjson(to_absolute_path(path_str))
         mean4 = data["neighbor"]["mean"]
         std4 = data["neighbor"]["std"]
@@ -202,8 +259,7 @@ class ObservationNormalizer:
 
     @classmethod
     def from_json2(cls, args_dict):
-        path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")
+        path_str = _pick_normalization_file_path(args_dict)
         data = openjson(to_absolute_path(path_str))
 
         ndt = {}

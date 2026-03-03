@@ -277,10 +277,10 @@ def get_args():
                         type=float,
                         help='feasible_learn_noise_thresh',
                         default=0.33)
-    parser.add_argument('--normalization_file_path',
-                        default='normalization.json',
-                        help='filepath of normalization.json',
-                        type=str)
+    # parser.add_argument('--normalization_file_path',
+    #                     default='normalization.json',
+    #                     help='filepath of normalization.json',
+    #                     type=str)
     parser.add_argument('--use_amortized_diffusion', default=True, type=boolean)
     parser.add_argument('--validate_scenario_rollouts', default=False,
                         type=boolean)
