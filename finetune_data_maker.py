@@ -3669,92 +3669,6 @@ def _get_or_build_inference_noise_bank_stack_for_candidate_range(
     return bank_stack
 
 
-def _get_or_build_inference_noise_bank_for_candidate(
-    *,
-    bank_cache: Dict[int, torch.Tensor],
-    device: torch.device,
-    dtype: torch.dtype,
-    batch_size: int,
-    one_or_pnn: int,
-    bank_len: int,
-    rollout_idx: int,
-    base_seed: int,
-    ddp_rank: int,
-    pose_based: bool,
-    noise_std: float,
-    seed_stride: int,
-    cand_idx: int,
-) -> torch.Tensor:
-    """특정 cand_idx에 대한 noise bank를 캐시에서 가져오거나, 없으면 새로 만듭니다.
-
-    핵심
-    ----
-    - bank는 "step과 무관"하게 1번만 만들기 위해, seed에는 step_idx를 넣지 않습니다.
-      (구현에서는 step_idx=0으로 고정해서 만듭니다.)
-    - cand_idx마다 다른 bank가 나오도록, base_seed에 cand_idx*seed_stride를 섞습니다.
-    - bank shape:
-        pose_based=True  -> (B, 1+Pnn, bank_len, 4)
-        pose_based=False -> (B, 1+Pnn, bank_len, 3)
-
-    Args:
-        bank_cache (Dict[int, torch.Tensor]): cand_idx -> bank 텐서 캐시. shape: ()
-        device (torch.device): bank를 둘 device. shape: ()
-        dtype (torch.dtype): bank dtype. shape: ()
-        batch_size (int): B. shape: ()
-        one_or_pnn (int): (1+Pnn). shape: ()
-        bank_len (int): bank 길이 L. shape: ()
-        rollout_idx (int): rollout 인덱스. shape: ()
-        base_seed (int): 기본 seed. shape: ()
-        ddp_rank (int): DDP rank. shape: ()
-        pose_based (bool): pose 기반 여부(노이즈 마지막 차원 결정). shape: ()
-        noise_std (float): 노이즈 표준편차(기존 fine_tune_temperature와 동일). shape: ()
-        seed_stride (int): cand_idx별 seed 간격. shape: ()
-        cand_idx (int): 후보 인덱스. shape: ()
-
-    Returns:
-        torch.Tensor: noise bank 텐서. shape: (B, 1+Pnn, bank_len, 4 or 3)
-    """
-    c_idx = int(cand_idx)
-    last_dim = 4 if bool(pose_based) else 3
-
-    expected_shape = (
-        int(batch_size),
-        int(one_or_pnn),
-        int(bank_len),
-        int(last_dim),
-    )
-
-    cached = bank_cache.get(c_idx, None)
-    if isinstance(cached, torch.Tensor):
-        if tuple(int(x) for x in cached.shape) == expected_shape:
-            # device/dtype만 맞추면 재사용 가능
-            if cached.device != device or cached.dtype != dtype:
-                cached = cached.to(device=device, dtype=dtype)
-                bank_cache[c_idx] = cached
-            return cached
-
-    # cand_idx를 seed에 섞어서 후보마다 다른 bank를 만들기
-    cand_base_seed = int(base_seed) + int(c_idx) * int(seed_stride)
-
-    # ✅ step_idx를 0으로 고정해서 "rollout 전체에서 공유되는 긴 bank"를 1번 생성
-    bank = _build_inference_noise_for_rollout_chunk(
-        device=device,
-        dtype=dtype,
-        batch_size=int(batch_size),
-        one_or_pnn=int(one_or_pnn),
-        future_len=int(bank_len),  # ✅ 긴 길이
-        rollout_idx=int(rollout_idx),
-        base_seed=int(cand_base_seed),
-        ddp_rank=int(ddp_rank),
-        step_idx=0,  # ✅ step seed 제거(고정)
-        pose_based=bool(pose_based),
-        noise_std=float(noise_std),
-    )
-
-    bank_cache[c_idx] = bank
-    return bank
-
-
 def _build_inference_noise_flat_from_bank_for_candidate_range(
     *,
     bank_cache: Dict[int, torch.Tensor],
@@ -3988,7 +3902,7 @@ def _forward_and_score_candidate_batch(
             )
         else:
             raise ValueError(
-                "inference_noise_bank_cache is required when use_amortized_diffusion=True"
+                "inference_noise_bank_cache is required when use_amortized_diffusion=False"
             )
 
     if need_amortized_random_noise:
