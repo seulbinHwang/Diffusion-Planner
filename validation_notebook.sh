@@ -191,8 +191,8 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "w_integ_loss_thres_1_p_sat_0.25_sft" \
-  --name "w_integ_loss_thres_1_p_sat_0.25_sft" \
+  --load_name "w_integ_loss_thres_1_p_sat_0.25" \
+  --name "w_integ_loss_thres_1_p_sat_0.25" \
   --eval_method "validation" \
   --batch_size 1 \
   --pose_based False \
