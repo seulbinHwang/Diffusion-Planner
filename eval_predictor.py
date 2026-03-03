@@ -2493,49 +2493,69 @@ def _get_unnorm_target_pose_chunk(
 
 
 def _convert_target_chunk_to_world(
-    unnorm_target_pose_chunk: torch.Tensor, # (B*R, (1+)Pnn, gap, 4)
+    unnorm_target_pose_chunk: torch.Tensor,  # (B*R, (1+)Pnn, gap, 4)
     gap: int,
-    unnorm_origin_pose_world: Optional[torch.Tensor], # (B*R, 4)
+    unnorm_origin_pose_world: Optional[torch.Tensor],  # (B*R, 4)
+    target_chunk_valid: Optional[torch.Tensor] = None,  # (B*R, (1+)Pnn, gap)
 ) -> Optional[torch.Tensor]:
     """원래 단위 포즈 chunk를 world 좌표로 바꿔 저장
 
-    하는 일
-    ------
-    - unnorm_origin_pose_world 가 None이면 아무 것도 하지 않고 None을 반환합니다.
-    - None이 아니면:
-      1) (B*R, (1+)Pnn, gap, 4) 포즈를 펼쳐서 world 좌표로 변환합니다.
+    변경점(핵심)
+    - 기존처럼 target_poses 값(0 여부)로 valid를 만들지 않고,
+      이미 존재하는 valid(target_chunk_valid)를 받아 그대로 사용합니다.
 
+    Args:
+        unnorm_target_pose_chunk:
+            (B*R, (1+)Pnn, gap, 4)
+        gap:
+            chunk 길이
+        unnorm_origin_pose_world:
+            (B*R, 4)
+        target_chunk_valid:
+            (B*R, (1+)Pnn, gap)  # True인 칸만 변환 결과를 유지, False는 0 유지
 
     Returns:
-        Optional[torch.Tensor]:
-            갱신된 origin_world_pose.
-            - 성공 시 shape: (B*R, (1+)Pnn, gap, 4)
-            - origin이 None이면 None
+        (B*R, (1+)Pnn, gap, 4) 또는 origin이 None이면 None
     """
     merged_batch = int(unnorm_target_pose_chunk.shape[0])  # B*R
-    one_or_pnn = int(unnorm_target_pose_chunk.shape[1])  # 1+Pnn
+    one_or_pnn = int(unnorm_target_pose_chunk.shape[1])    # 1+Pnn
 
     if unnorm_origin_pose_world is None:
         return None
 
     if int(gap) <= 0:
         raise ValueError(f"gap은 1 이상이어야 합니다. gap={gap}")
+
     # (B*R*(1+)Pnn, gap, 4)
-    unnorm_target_pose_chunk_flat = unnorm_target_pose_chunk.reshape(
-        -1, int(gap), 4)
+    unnorm_target_pose_chunk_flat = unnorm_target_pose_chunk.reshape(-1, int(gap), 4)
+
+    # (선택) valid도 같은 방식으로 flatten
+    target_chunk_valid_flat: Optional[torch.Tensor] = None
+    if target_chunk_valid is not None:
+        if not isinstance(target_chunk_valid, torch.Tensor):
+            raise TypeError("target_chunk_valid는 torch.Tensor 또는 None이어야 합니다.")
+        if target_chunk_valid.dim() != 3:
+            raise ValueError(
+                "target_chunk_valid는 (B*R, (1+)Pnn, gap) 형태여야 합니다. "
+                f"got shape={tuple(target_chunk_valid.shape)}"
+            )
+        if int(target_chunk_valid.shape[0]) != merged_batch or int(target_chunk_valid.shape[1]) != one_or_pnn or int(target_chunk_valid.shape[2]) != int(gap):
+            raise ValueError(
+                "target_chunk_valid shape가 unnorm_target_pose_chunk와 맞지 않습니다. "
+                f"pose={(merged_batch, one_or_pnn, int(gap))}, "
+                f"valid={tuple(target_chunk_valid.shape)}"
+            )
+        target_chunk_valid_flat = target_chunk_valid.reshape(-1, int(gap))  # (N, gap)
 
     # world 변환: (B*R*(1+)Pnn, gap, 4)
     unnorm_target_pose_chunk_world_flat = _covert_from_ego_to_world(
-        target_poses=unnorm_target_pose_chunk_flat,
-        origin_world_pose=unnorm_origin_pose_world,  # (B*R, 4)
+        target_poses=unnorm_target_pose_chunk_flat,   # (N, gap, 4)
+        origin_world_pose=unnorm_origin_pose_world,   # (B*R, 4)
+        valid_mask=target_chunk_valid_flat,           # (N, gap) 또는 None
     )
 
     # (B*R, (1+)Pnn, gap, 4)
-    unnorm_target_pose_chunk_world = unnorm_target_pose_chunk_world_flat.reshape(
-        int(merged_batch), int(one_or_pnn), int(gap), 4)
-
-    return unnorm_target_pose_chunk_world
-
+    return unnorm_target_pose_chunk_world_flat.reshape(merged_batch, one_or_pnn, int(gap), 4)
 
 def _match_device_and_dtype(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """x를 ref와 같은 device/dtype으로 맞춥니다.
@@ -2754,36 +2774,32 @@ def _predict_rollouts_batched_one_chunk(
 
     rotate_seg_control_xy_in_origin: bool = _should_rotate_seg_control_xy_in_origin_transform(
         args)
+    # ✅ (추가) non-amortized면: 긴 노이즈 bank를 1번만 만들고 슬라이딩해서 씁니다.
+    use_amortized = bool(getattr(args, "use_amortized_diffusion", False))
+    pose_based_flag = bool(getattr(args, "pose_based", True))
+    inference_noise_bank: Optional[torch.Tensor] = None
     with torch.inference_mode():
         step_start = 0
         while step_start < future_len:
-            reference_tensor = norm_inputs_b_r_copy["ego_agent_past"]
-            device = reference_tensor.device
-            dtype = reference_tensor.dtype
-
             remaining = int(future_len - step_start)
             gap = int(min(time_chunk_size, remaining))
 
             # ✅ chunk 시작 시점에만 unnorm -> norm 1번
             (norm_inputs_b_r_copy,
              norm_outputs_b_r_copy) = _build_norm_inputs_from_unnorm_inputs(
-                 unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
-                 unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
-                 state_normalizer=state_normalizer,
-                 observation_normalizer=observation_normalizer,
-             )
-            use_amortized = bool(getattr(args, "use_amortized_diffusion",
-                                         False))
+                unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+                unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
+                state_normalizer=state_normalizer,
+                observation_normalizer=observation_normalizer,
+            )
 
-            # (A) 첫 스텝(step_start==0) 또는 non-amortized에서는 기존처럼 inference_noise를 넣음
-            need_inference_noise = (not use_amortized) or (use_amortized and
-                                                           int(step_start) == 0)
-            pose_based_flag = bool(getattr(args, "pose_based", True))
+            reference_tensor = norm_inputs_b_r_copy["ego_agent_past"]
+            device = reference_tensor.device
+            dtype = reference_tensor.dtype
 
-            if need_inference_noise:
-                # inference_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
-                # (A) inference_noise
-                inference_noise = _build_inference_noise_for_rollout_chunk(
+            # ✅ (추가) non-amortized면 noise_bank를 최초 1회만 생성
+            if (not use_amortized) and (inference_noise_bank is None):
+                inference_noise_bank = _build_inference_noise_bank_for_rollout_batch(
                     device=device,
                     dtype=dtype,
                     batch_size=int(batch_size),
@@ -2793,20 +2809,46 @@ def _predict_rollouts_batched_one_chunk(
                     rollout_repeat=int(rollout_repeat),
                     base_seed=int(base_seed),
                     ddp_rank=int(ddp_rank),
-                    step_idx=int(step_start),
-                    pose_based=pose_based_flag,
+                    pose_based=bool(pose_based_flag),
                     noise_std=float(getattr(args, "eval_temperature", 0.5)),
                 )
 
+            # (A) 첫 스텝(step_start==0) 또는 non-amortized에서는 inference_noise를 넣음
+            need_inference_noise = (not use_amortized) or (
+                        use_amortized and int(step_start) == 0)
+
+            if need_inference_noise:
+                if not use_amortized:
+                    if inference_noise_bank is None:
+                        raise RuntimeError(
+                            "use_amortized_diffusion=False 인데 inference_noise_bank가 준비되지 않았습니다.")
+                    # ✅ 핵심: step_start로 window 슬라이딩
+                    inference_noise = _slice_inference_noise_from_bank(
+                        noise_bank=inference_noise_bank,
+                        step_start=int(step_start),
+                        future_len=int(future_len),
+                    )
+                else:
+                    # (기존 유지) amortized + step_start==0에서만 inference_noise 생성
+                    inference_noise = _build_inference_noise_for_rollout_chunk(
+                        device=device,
+                        dtype=dtype,
+                        batch_size=int(batch_size),
+                        one_or_pnn=int(one_or_pnn),
+                        future_len=int(future_len),
+                        rollout_start_idx=int(rollout_start_idx),
+                        rollout_repeat=int(rollout_repeat),
+                        base_seed=int(base_seed),
+                        ddp_rank=int(ddp_rank),
+                        step_idx=int(step_start),
+                        pose_based=bool(pose_based_flag),
+                        noise_std=float(getattr(args, "eval_temperature", 0.5)),
+                    )
             else:
                 inference_noise = None
 
-            # (B) amortized + step_start>0에서는 Decoder 내부 랜덤 대신
-            #     rollout_idx(seed) 기반 표준정규 노이즈를 inputs로 전달
+            # (B) amortized + step_start>0에서는 Decoder 내부 랜덤 대신 표준정규 노이즈 전달
             if use_amortized:
-                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
-                # ✅ 표준정규를 맞추기 위해 noise_std=1.0
-                # (B) amortized_random_noise
                 amortized_random_noise = _build_inference_noise_for_rollout_chunk(
                     device=device,
                     dtype=dtype,
@@ -2818,7 +2860,7 @@ def _predict_rollouts_batched_one_chunk(
                     base_seed=int(base_seed),
                     ddp_rank=int(ddp_rank),
                     step_idx=int(step_start),
-                    pose_based=pose_based_flag,
+                    pose_based=bool(pose_based_flag),
                     noise_std=1.0,
                 )
             else:
@@ -2834,6 +2876,7 @@ def _predict_rollouts_batched_one_chunk(
                 dtype=torch.int64,
                 device=norm_inputs_b_r_copy["ego_agent_past"].device,
             )
+
             decoder_output = _forward_model_for_validation(
                 args=args,
                 model=model,
@@ -2927,13 +2970,17 @@ def _predict_rollouts_batched_one_chunk(
                 target_future_control_seq=target_future_control_seq,
                 gap=int(gap),
             )
-            # unnorm_target_pose_chunk_world: (B*R, (1+)Pnn, gap, 4)
-            unnorm_target_pose_chunk_world = _convert_target_chunk_to_world(
-                unnorm_target_pose_chunk=unnorm_target_pose_chunk, # (B*R, (1+)Pnn, gap, 4)
-                gap=int(gap),
-                unnorm_origin_pose_world=unnorm_origin_pose_world, # (B*R, 4)
-            )
+            # unnorm_target_pose_chunk: (B*R, (1+)Pnn, gap, 4)
+            # 이미 존재하는 valid 데이터 활용: (B*R, (1+)Pnn, gap)
+            target_chunk_valid = norm_inputs_b_r_copy["target_future_valid"][
+                :, :, :gap]
 
+            unnorm_target_pose_chunk_world = _convert_target_chunk_to_world(
+                unnorm_target_pose_chunk=unnorm_target_pose_chunk,
+                gap=int(gap),
+                unnorm_origin_pose_world=unnorm_origin_pose_world,
+                target_chunk_valid=target_chunk_valid,
+            )
             target_joint_scene_world[:, :, step_start:step_start +
                                      gap, :] = unnorm_target_pose_chunk_world
 
@@ -3295,7 +3342,140 @@ def _build_inference_noise_for_rollout_chunk(
         int(last_dim),
     )
 
+def _get_inference_noise_bank_length(future_len: int) -> int:
+    """긴 노이즈 텐서(noise_bank)의 길이를 정합니다.
 
+    목표
+    ----
+    step_start가 커져도,
+    noise_bank에서 [step_start : step_start + future_len] 구간을 항상 잘라 쓸 수 있게
+    충분히 큰 길이를 보장합니다.
+
+    Args:
+        future_len (int):
+            모델이 한 번에 예측하는 미래 길이.
+            shape: ()
+
+    Returns:
+        int:
+            noise_bank 길이.
+            shape: ()
+    """
+    fut = int(future_len)
+    if fut <= 0:
+        raise ValueError(f"future_len은 1 이상이어야 합니다. future_len={future_len}")
+
+    # step_start 최댓값이 (future_len-1)인 경우까지 안전하게 커버
+    # 필요한 최소 길이는 (future_len + (future_len-1)) 이지만,
+    # 단순하고 안전하게 2*future_len로 잡습니다.
+    return int(2 * fut)
+
+
+def _build_inference_noise_bank_for_rollout_batch(
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    one_or_pnn: int,
+    future_len: int,
+    rollout_start_idx: int,
+    rollout_repeat: int,
+    base_seed: int,
+    ddp_rank: int,
+    pose_based: bool,
+    noise_std: float,
+) -> torch.Tensor:
+    """non-amortized에서 쓸 '긴 노이즈 bank'를 rollout마다 1번만 만듭니다.
+
+    동작
+    ----
+    - rollout(전역 rollout_idx)마다 seed가 달라서 서로 다른 결과가 나오게 합니다.
+    - step_start가 바뀌어도 이 bank에서 잘라 쓰므로,
+      chunk 경계에서 겹치는 구간의 노이즈가 동일해집니다.
+
+    Args:
+        device (torch.device): 생성될 텐서 device. shape: ()
+        dtype (torch.dtype): 생성될 텐서 dtype. shape: ()
+        batch_size (int): B. shape: ()
+        one_or_pnn (int): A=(1+)Pnn. shape: ()
+        future_len (int): T=future_len. shape: ()
+        rollout_start_idx (int): 이번 묶음 시작 rollout 인덱스. shape: ()
+        rollout_repeat (int): 이번에 동시에 처리하는 rollout 개수 R. shape: ()
+        base_seed (int): 기본 seed. shape: ()
+        ddp_rank (int): 프로세스 rank. shape: ()
+        pose_based (bool): True면 마지막 차원 4, 아니면 3. shape: ()
+        noise_std (float): 노이즈 크기(예: eval_temperature). shape: ()
+
+    Returns:
+        torch.Tensor:
+            noise_bank 텐서.
+            shape:
+              - pose_based=True  -> (B*R, A, bank_len, 4)
+              - pose_based=False -> (B*R, A, bank_len, 3)
+    """
+    bank_len = _get_inference_noise_bank_length(int(future_len))
+
+    # ✅ seed는 step_idx에 의존하지 않게 step_idx=0으로 고정
+    #    (rollout_idx 기반 재현성 유지)
+    return _build_inference_noise_for_rollout_chunk(
+        device=device,
+        dtype=dtype,
+        batch_size=int(batch_size),
+        one_or_pnn=int(one_or_pnn),
+        future_len=int(bank_len),
+        rollout_start_idx=int(rollout_start_idx),
+        rollout_repeat=int(rollout_repeat),
+        base_seed=int(base_seed),
+        ddp_rank=int(ddp_rank),
+        step_idx=0,
+        pose_based=bool(pose_based),
+        noise_std=float(noise_std),
+    )
+
+
+def _slice_inference_noise_from_bank(
+    noise_bank: torch.Tensor,  # (B*R, A, bank_len, D)
+    step_start: int,
+    future_len: int,
+) -> torch.Tensor:
+    """noise_bank에서 현재 step_start에 맞는 구간을 잘라 반환합니다.
+
+    Args:
+        noise_bank (torch.Tensor):
+            미리 만들어 둔 긴 노이즈 텐서.
+            shape: (B*R, A, bank_len, D)
+        step_start (int):
+            현재까지 진행한 스텝(0부터).
+            shape: ()
+        future_len (int):
+            한 번 예측에 필요한 길이.
+            shape: ()
+
+    Returns:
+        torch.Tensor:
+            잘라낸 inference_noise.
+            shape: (B*R, A, future_len, D)
+    """
+    if noise_bank.dim() != 4:
+        raise ValueError(
+            "noise_bank는 (B*R, A, bank_len, D) 형태여야 합니다. "
+            f"got shape={tuple(noise_bank.shape)}"
+        )
+
+    start = int(step_start)
+    fut = int(future_len)
+    if fut <= 0:
+        raise ValueError(f"future_len은 1 이상이어야 합니다. future_len={future_len}")
+
+    bank_len = int(noise_bank.shape[2])
+    end = start + fut
+    if start < 0 or end > bank_len:
+        raise ValueError(
+            "noise_bank 길이가 부족합니다. "
+            f"step_start={start}, future_len={fut}, bank_len={bank_len}"
+        )
+
+    # view로 반환(추가 메모리 할당 없음)
+    return noise_bank[:, :, start:end, :]
 
 def _make_rollout_seed(
     base_seed: int,
@@ -5815,47 +5995,31 @@ def _expand_origin_world_pose_for_agents(
     return origin_world_pose.repeat_interleave(repeat_factor, dim=0)
 
 
+
 def _covert_from_ego_to_world(
-        target_poses: torch.Tensor,  # (N, 4) 또는 (N, T, 4)
-        origin_world_pose: torch.Tensor,  # (B, 4) 또는 (N, 4) 또는 (1, 4)
+    target_poses: torch.Tensor,            # (N, 4) 또는 (N, T, 4)
+    origin_world_pose: torch.Tensor,       # (B, 4) 또는 (N, 4) 또는 (1, 4)
+    valid_mask: Optional[torch.Tensor] = None,  # (N,) 또는 (N, T)
 ) -> torch.Tensor:
     """ego 기준 포즈를 world 기준 포즈로 바꿉니다.
 
-    이 함수는 (x, y, cos, sin) 형태의 포즈를 변환합니다.
-
-    - target_poses는 "ego를 원점(0,0)으로 보는 좌표"에서의 값입니다.
-    - origin_world_pose는 "ego 원점이 world에서 어디에 있고, 어느 방향을 보고 있는지"를 나타냅니다.
-
-    변환 방법은 다음 순서로 진행합니다.
-
-    1) 위치(x, y) 변환
-       - ego 기준 (x, y)를 origin_world_pose의 방향만큼 돌린 뒤,
-         origin_world_pose의 (x, y)를 더해서 world 위치로 만듭니다.
-
-    2) 방향(cos, sin) 변환
-       - ego 기준 방향과 origin_world_pose의 방향을 합쳐서 world 방향으로 만듭니다.
-       - (cos, sin)이 길이 1이 아니게 흔들릴 수 있으니, 변환 전에 길이를 1로 정리합니다.
-
-    3) 무효 프레임 처리
-       - 마지막 차원 4개 값이 모두 0인 경우는 "패딩(없는 데이터)"로 보고,
-         변환 결과도 0을 유지합니다.
-         (이 처리를 안 하면, (0,0,0,0)이 origin 위치/방향으로 바뀌어버리는 문제가 생깁니다.)
+    변경점(핵심)
+    - valid_mask가 주어지면, 그 마스크를 그대로 사용해
+      무효 프레임은 0을 유지합니다.
+    - (이 경로에서는 target_poses 값(0 여부)로 valid를 새로 만들지 않습니다.)
 
     Args:
-        target_poses: (N, 4) 또는 (N, T, 4)
-            - N: agent 개수(예: B*(1+Pnn))
-            - T: 시간 길이(future_len 등)
-            - 마지막 4: (x, y, cos, sin)  (ego 기준)
-        origin_world_pose: (B, 4) 또는 (N, 4) 또는 (1, 4)
-            - B: 배치 크기
-            - 마지막 4: (x, y, cos, sin)  (world 기준)
+        target_poses:
+            (N, 4) 또는 (N, T, 4)
+        origin_world_pose:
+            (B, 4) 또는 (N, 4) 또는 (1, 4)
+        valid_mask:
+            (N,) 또는 (N, T)  # target_poses.shape[:-1] 와 동일해야 함
 
     Returns:
-        world_pose: ego_pose와 같은 shape
-            - (N, 4) 또는 (N, T, 4)
-            - 마지막 4: (x, y, cos, sin)  (world 기준)
+        world_pose: target_poses와 같은 shape
     """
-    if target_poses.dim() not in (2, 3) or target_poses.shape[-1] != 4:
+    if target_poses.dim() not in (2, 3) or int(target_poses.shape[-1]) != 4:
         raise ValueError("ego_pose는 (N, 4) 또는 (N, T, 4) 여야 합니다. "
                          f"현재 shape={tuple(target_poses.shape)}")
 
@@ -5863,14 +6027,13 @@ def _covert_from_ego_to_world(
     origin_world_pose_per_agent = _expand_origin_world_pose_for_agents(
         origin_world_pose=origin_world_pose,
         n_agent=n_agent,
-    )  # (N(=B*(1+Pnn), 4)
+    )  # (N, 4)
 
     # origin pose (world)
     origin_xy = origin_world_pose_per_agent[:, 0:2]  # (N, 2)
     origin_cos_raw = origin_world_pose_per_agent[:, 2]  # (N,)
     origin_sin_raw = origin_world_pose_per_agent[:, 3]  # (N,)
-    origin_cos, origin_sin = _normalize_cos_sin_for_rotation(
-        origin_cos_raw, origin_sin_raw)  # (N,), (N,)
+    origin_cos, origin_sin = _normalize_cos_sin_for_rotation(origin_cos_raw, origin_sin_raw)  # (N,), (N,)
 
     # ego pose (ego frame)
     ego_xy = target_poses[..., 0:2]  # (N, 2) 또는 (N, T, 2)
@@ -5878,34 +6041,50 @@ def _covert_from_ego_to_world(
     ego_sin_raw = target_poses[..., 3]  # (N,) 또는 (N, T)
     ego_cos, ego_sin = _normalize_cos_sin_for_rotation(ego_cos_raw, ego_sin_raw)
 
-    # 브로드캐스팅을 위해 (N, 2)/(N,) -> (N, 1, 2)/(N, 1) 로 확장 (T가 있는 경우)
+    # 브로드캐스팅
     if target_poses.dim() == 2:
-        origin_xy_b = origin_xy  # (N, 2)
-        origin_cos_b = origin_cos  # (N,)
-        origin_sin_b = origin_sin  # (N,)
+        origin_xy_b = origin_xy
+        origin_cos_b = origin_cos
+        origin_sin_b = origin_sin
     else:
-        origin_xy_b = origin_xy[:, None, :]  # (N, 1, 2)
-        origin_cos_b = origin_cos[:, None]  # (N, 1)
-        origin_sin_b = origin_sin[:, None]  # (N, 1)
+        origin_xy_b = origin_xy[:, None, :]   # (N, 1, 2)
+        origin_cos_b = origin_cos[:, None]    # (N, 1)
+        origin_sin_b = origin_sin[:, None]    # (N, 1)
 
-    # 1) 위치 변환: world_xy = origin_xy + R(origin_yaw) * ego_xy
+    # 1) 위치 변환
     ego_x = ego_xy[..., 0]
     ego_y = ego_xy[..., 1]
     world_x = origin_xy_b[..., 0] + origin_cos_b * ego_x - origin_sin_b * ego_y
     world_y = origin_xy_b[..., 1] + origin_sin_b * ego_x + origin_cos_b * ego_y
 
-    # 2) 방향 변환: yaw_world = yaw_origin + yaw_ego
-    # cos(yaw_o + yaw_e) = cos_o*cos_e - sin_o*sin_e
-    # sin(yaw_o + yaw_e) = sin_o*cos_e + cos_o*sin_e
+    # 2) 방향 변환
     world_cos = origin_cos_b * ego_cos - origin_sin_b * ego_sin
     world_sin = origin_sin_b * ego_cos + origin_cos_b * ego_sin
 
     world_pose = torch.stack([world_x, world_y, world_cos, world_sin], dim=-1)
 
-    # 3) 무효 프레임(전부 0)인 경우는 그대로 0을 유지
-    valid_mask = torch.any(target_poses != 0.0, dim=-1)  # (N,) 또는 (N, T)
-    world_pose = torch.where(valid_mask[..., None], world_pose,
-                             torch.zeros_like(world_pose))
+    # 3) 무효 프레임은 0 유지 (✅ 기존 valid 데이터 사용)
+    if valid_mask is None:
+        # (호환용 fallback) 호출자가 valid를 안 주면 기존 방식 유지
+        valid_mask_bool = torch.any(target_poses != 0.0, dim=-1)
+    else:
+        expected_shape = tuple(int(x) for x in target_poses.shape[:-1])
+        got_shape = tuple(int(x) for x in valid_mask.shape)
+        if got_shape != expected_shape:
+            raise ValueError(
+                "valid_mask shape가 target_poses와 맞지 않습니다. "
+                f"expected={expected_shape}, got={got_shape}"
+            )
+
+        if valid_mask.dtype == torch.bool:
+            valid_mask_bool = valid_mask
+        else:
+            # 0/1 또는 float 마스크도 안전하게 처리
+            valid_mask_bool = (valid_mask != 0)
+
+        valid_mask_bool = valid_mask_bool.to(device=world_pose.device, dtype=torch.bool)
+
+    world_pose = torch.where(valid_mask_bool[..., None], world_pose, torch.zeros_like(world_pose))
     return world_pose
 
 def _enforce_pose_based_requires_feasible(args: argparse.Namespace) -> None:

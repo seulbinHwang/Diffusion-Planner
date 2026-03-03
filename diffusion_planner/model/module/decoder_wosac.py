@@ -586,6 +586,71 @@ class Decoder(nn.Module):
                 )
         return xt_reshaped
 
+    def _enforce_unit_cos_sin_on_output_pose_sequence_inplace(
+            self,
+            pose_sequence: torch.Tensor,  # (B, P, S, 4)
+            valid_mask: torch.Tensor,  # (B, P, S)  bool/0-1
+            eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """추론 출력에서 (cos, sin)을 유효한 시점에 대해 길이 1로 맞춥니다.
+
+        - 무효 시점(False)은 (x,y,cos,sin) 모두 0으로 고정합니다.
+        - 유효 시점(True)은 (cos,sin)만 길이 1이 되도록 나눠서 정리합니다.
+        - (cos,sin) 길이가 너무 작으면(거의 0이면) 유효 시점이라도 (1,0)으로 둡니다.
+
+        Args:
+            pose_sequence (torch.Tensor):
+                포즈 시퀀스 텐서.
+                shape: (B, P, S, 4) = [x, y, cos, sin]
+            valid_mask (torch.Tensor):
+                유효 마스크.
+                shape: (B, P, S)
+                True=유효, False=무효(패딩)
+            eps (float):
+                0으로 나눔을 막기 위한 작은 값.
+
+        Returns:
+            torch.Tensor:
+                입력과 같은 텐서(값은 in-place로 갱신됨).
+                shape: (B, P, S, 4)
+
+        Raises:
+            ValueError: shape이 기대와 다를 때
+        """
+        if pose_sequence.dim() != 4 or int(pose_sequence.shape[-1]) != 4:
+            raise ValueError(
+                "pose_sequence는 (B,P,S,4) 여야 합니다. "
+                f"got shape={tuple(pose_sequence.shape)}"
+            )
+        if tuple(int(x) for x in valid_mask.shape) != tuple(
+                int(x) for x in pose_sequence.shape[:-1]
+        ):
+            raise ValueError(
+                "valid_mask shape가 pose_sequence와 맞지 않습니다. "
+                f"expected={tuple(int(x) for x in pose_sequence.shape[:-1])}, "
+                f"got={tuple(int(x) for x in valid_mask.shape)}"
+            )
+
+        valid = _to_bool_mask(valid_mask).to(device=pose_sequence.device,
+                                             dtype=torch.bool)
+
+        # 1) 무효 칸은 전부 0으로 고정
+        pose_sequence.masked_fill_(~valid.unsqueeze(-1), 0.0)
+
+        # 2) 유효 칸만 (cos,sin) 단위원 정리
+        cos_raw = pose_sequence[..., 2]  # (B,P,S)
+        sin_raw = pose_sequence[..., 3]  # (B,P,S)
+
+        cos_norm, sin_norm = self._normalize_cos_sin_for_rotation(
+            cos_raw, sin_raw, eps=float(eps)
+        )  # (B,P,S) each
+
+        zeros = torch.zeros_like(cos_norm)
+        pose_sequence[..., 2] = torch.where(valid, cos_norm, zeros)
+        pose_sequence[..., 3] = torch.where(valid, sin_norm, zeros)
+
+        return pose_sequence
+
     def _project_future_yaw_to_unit_circle(
             self,
             xt_sequence: torch.Tensor,  # shape: (B, Pnn, _, 4)
@@ -2377,6 +2442,24 @@ class Decoder(nn.Module):
                 diffusion_sequence=diffusion_sequence,
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
+            # ✅ (추론 출력 보정) pose_based=True일 때만:
+            # 현재+미래 유효 마스크: (B, (1+)Pnn, 1+T)
+            cur_future_valid_out: Optional[torch.Tensor] = None
+            if bool(self.config.pose_based):
+                cur_future_valid_out = _to_bool_mask(
+                    target_past_cur_future_valid[
+                        :, :, -(1 + int(self._future_len)):]
+                ).to(device=diffusion_cur_future_sequence.device)
+
+                # (A) use_current_input=False(+future-only)에서 current를 cat하는 경로만 최소 보정
+                if (not bool(self.config.use_current_input)) and (
+                not bool(self.config.use_past_dit_input)):
+                    diffusion_cur_future_sequence = self._enforce_unit_cos_sin_on_output_pose_sequence_inplace(
+                        pose_sequence=diffusion_cur_future_sequence,
+                        # (B,P,1+T,4)
+                        valid_mask=cur_future_valid_out,  # (B,P,1+T)
+                    )
+
             # 6) diffusion_cur_future_sequence: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
             decoder_output_dict[
                 "diffusion_sequence"] = diffusion_cur_future_sequence
@@ -2449,6 +2532,22 @@ class Decoder(nn.Module):
                 decoder_output_dict=decoder_output_dict,
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
+            # ✅ (추론 출력 보정) integrated_trajectory는 항상 current를 cat하므로, pose_based면 항상 보정
+            if bool(self.config.pose_based) and (
+                    "integrated_trajectory" in decoder_output_dict):
+                if cur_future_valid_out is None:
+                    cur_future_valid_out = _to_bool_mask(
+                        target_past_cur_future_valid[
+                            :, :, -(1 + int(self._future_len)):]
+                    ).to(device=decoder_output_dict[
+                        "integrated_trajectory"].device)
+
+                decoder_output_dict[
+                    "integrated_trajectory"] = self._enforce_unit_cos_sin_on_output_pose_sequence_inplace(
+                    pose_sequence=decoder_output_dict["integrated_trajectory"],
+                    # (B,P,1+T,4)
+                    valid_mask=cur_future_valid_out,  # (B,P,1+T)
+                )
             """ decoder_output_dict
             "diffusion_output" : (B, (1+)Pnn, T, 4) / (B, (1+)Pnn, T, 3)
             "diffusion_sequence" : (B, (1+)Pnn, T, 4) / (B, (1+)Pnn, T, 3)
