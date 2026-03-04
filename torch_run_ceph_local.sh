@@ -112,10 +112,7 @@ FORCE_REBUILD=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "use_npc_data_augment_true_use_body_vel_false" \
-    --load_name "use_npc_data_augment_true_use_body_vel_false" \
-    --resume_wandb_model_name latest \
-    --resume_model_only False \
+    --name "use_npc_data_augment_true_use_body_vel_false_new_norm" \
     --batch_size 1536 \
     --train_epochs 400 \
     --learning_rate 1e-3 \
