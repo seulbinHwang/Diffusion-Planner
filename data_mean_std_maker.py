@@ -607,7 +607,13 @@ def _update_lanes_stats(
     if lanes_speed_limit is None:
         return
     sl = np.asarray(lanes_speed_limit)
-    if sl.ndim != 1 or int(sl.shape[0]) != int(ln.shape[0]):
+    # (L,) 또는 (L,1)을 모두 허용
+    if sl.ndim == 2 and int(sl.shape[1]) == 1:
+        sl = sl[:, 0]  # (L,)
+    elif sl.ndim != 1:
+        return
+
+    if int(sl.shape[0]) != int(ln.shape[0]):
         return
 
     lane_valid = valid_point.any(axis=1)  # (L,)
