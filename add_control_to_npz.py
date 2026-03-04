@@ -2115,14 +2115,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default="/home/user/womd_v1_3/processed_womd_0124/validation_world_v",
+        default="/workspace/local_shards_v_world",
         help="npz 파일들이 들어있는 폴더(내부 폴더 없음)",
     )
     parser.add_argument(
         "--train_json",
         type=str,
-        default=
-        "/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json",
+        default="/workspace/local_shards_v_world/diffusion_planner_training.json",
         help="학습에 쓰는 npz 파일명 리스트(json)",
     )
     parser.add_argument(
@@ -2392,5 +2391,6 @@ python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sampl
 
 # 이미 저장된 파생키도 다시 계산해서 갱신
 python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --overwrite_sample_keys
+python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --only_calculate_statistics
 
 """
