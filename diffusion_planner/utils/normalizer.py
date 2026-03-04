@@ -121,6 +121,7 @@ class StateNormalizer:
         std4 = data["neighbor"]["std"]
         mean3 = data["seg_body_control"]["mean"]
         std3 = data["seg_body_control"]["std"]
+        print("mean3: ", mean3, "std3: ", std3)
         return cls(mean=mean4, std=std4, seg_mean=mean3, seg_std=std3)
 
     @staticmethod

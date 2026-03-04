@@ -1748,6 +1748,33 @@ class FeasibleProjector(nn.Module):
 
         return torch.stack([vx_b, vy_b, omega], dim=-1)  # (B,Pnn,T,3)
 
+
+    @staticmethod
+    def _body_to_world(
+        vx_b: torch.Tensor,
+        vy_b: torch.Tensor,
+        cos_yaw: torch.Tensor,
+        sin_yaw: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """몸체 기준 속도를 세계 기준 속도로 회전합니다.
+
+        수식:
+            v^w = R(ψ) v^b,  R(ψ) = [[cosψ, -sinψ], [sinψ, cosψ]]
+
+        Args:
+            vx_b (torch.Tensor): 몸체 x방향 속도. shape: (..., T) 또는 (...,)
+            vy_b (torch.Tensor): 몸체 y방향 속도. shape: (..., T) 또는 (...,)
+            cos_yaw (torch.Tensor): cos(ψ). shape: vx_b와 동일
+            sin_yaw (torch.Tensor): sin(ψ). shape: vx_b와 동일
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                (vx_w, vy_w) 세계 기준 속도. shape: vx_b와 동일
+        """
+        vx_w = cos_yaw * vx_b - sin_yaw * vy_b
+        vy_w = sin_yaw * vx_b + cos_yaw * vy_b
+        return vx_w, vy_w
+
     @staticmethod
     def _world_to_body(
         vx_w: torch.Tensor,
@@ -1773,7 +1800,69 @@ class FeasibleProjector(nn.Module):
         vyb = -sin_yaw * vx_w + cos_yaw * vy_w
         return vxb, vyb
 
-    # <추가하자>
+
+    def _convert_body_controls_to_world_for_output(
+        self,
+        unnorm_near_current_state: torch.Tensor,        # (B, Pnn, 4)
+        unnorm_cur_future_seg_body_control: torch.Tensor,  # (B, Pnn, T, 3)
+        *,
+        dt: float,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """필터/적분이 끝난 '몸체 기준 control_sequence'를 세계 기준으로 바꿔 반환합니다.
+
+        목적:
+            - use_body_vel=False일 때, 바깥(eval/rollout) 코드는 (vx,vy)를 "세계 기준"으로 가정하고
+              원점 이동/회전 변환을 적용합니다.
+            - 그런데 Feasible 내부는 제약/적분을 위해 body로 계산하므로,
+              최종 control_sequence를 world로 다시 맞춰서 내보내야 입력 의미가 깨지지 않습니다.
+
+        중요한 점:
+            - 여기서는 control_constraint_diff에는 손대지 않습니다.
+              (diff는 body 기준으로 계산된 값을 그대로 유지)
+
+        Args:
+            unnorm_near_current_state (torch.Tensor):
+                현재 상태 [x0, y0, cos0, sin0]. shape: (B, Pnn, 4)
+            unnorm_cur_future_seg_body_control (torch.Tensor):
+                [vx_body, vy_body, omega]. shape: (B, Pnn, T, 3)
+            dt (float):
+                시간 간격(초). yaw_mid 계산에 사용
+            eps (float):
+                수치 안정용 작은 값
+
+        Returns:
+            torch.Tensor:
+                [vx_world, vy_world, omega]. shape: (B, Pnn, T, 3)
+        """
+        if unnorm_cur_future_seg_body_control.dim() != 4 or int(unnorm_cur_future_seg_body_control.shape[-1]) != 3:
+            raise ValueError(
+                "_convert_body_controls_to_world_for_output: "
+                "unnorm_cur_future_seg_body_control은 (B,Pnn,T,3) 여야 합니다. "
+                f"got shape={tuple(unnorm_cur_future_seg_body_control.shape)}"
+            )
+
+        vx_b = unnorm_cur_future_seg_body_control[..., 0]   # (B,Pnn,T)
+        vy_b = unnorm_cur_future_seg_body_control[..., 1]   # (B,Pnn,T)
+        omega = unnorm_cur_future_seg_body_control[..., 2]  # (B,Pnn,T)
+
+        # 적분에서 쓰는 것과 같은 규칙으로 '세그먼트 중간 방향' cos/sin을 계산
+        cos_mid, sin_mid = self._compute_segment_mid_cos_sin_from_omega(
+            unnorm_near_current_state=unnorm_near_current_state,  # (B,Pnn,4)
+            omega_seq=omega,                                      # (B,Pnn,T)
+            dt=float(dt),
+            eps=float(eps),
+        )  # (B,Pnn,T) each
+
+        vx_w, vy_w = self._body_to_world(
+            vx_b=vx_b,
+            vy_b=vy_b,
+            cos_yaw=cos_mid,
+            sin_yaw=sin_mid,
+        )
+
+        return torch.stack([vx_w, vy_w, omega], dim=-1)  # (B,Pnn,T,3)
+
     def _prepare_midpoint_inputs(
         self,
         unnorm_diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
@@ -4252,6 +4341,15 @@ class FeasibleProjector(nn.Module):
             device=device,
             dtype=dtype,
         )
+        # ✅ [핵심 추가] use_body_vel=False면 최종 control_sequence만 world 기준으로 되돌려 반환
+        # - control_constraint_diff는 그대로(body 기준) 유지
+        if not bool(use_body_vel):
+            unnorm_control_sequence = self._convert_body_controls_to_world_for_output(
+                unnorm_near_current_state=unnorm_near_current_state,   # (B,Pnn,4)
+                unnorm_cur_future_seg_body_control=unnorm_control_sequence,  # (B,Pnn,T,3) body
+                dt=float(self.constraints_h_params.dt),
+                eps=float(self.constraints_h_params.eps),
+            )  # (B,Pnn,T,3) world
 
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff, unnorm_control_sequence
 
