@@ -661,7 +661,8 @@ def get_args():
     args = parser.parse_args()
     # ★ stage config(json/yaml)로 CLI 인자 덮어쓰기
     args = _override_args_with_stage_config(args)
-    args.state_normalizer = StateNormalizer.from_json(args)
-    args.observation_normalizer = ObservationNormalizer.from_json(args)
+    args_dict = vars(args)
+    args.state_normalizer = StateNormalizer.from_json2(args_dict)
+    args.observation_normalizer = ObservationNormalizer.from_json2(args_dict)
 
     return args

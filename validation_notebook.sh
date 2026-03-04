@@ -191,8 +191,8 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "w_integ_loss_thres_1_p_sat_0.25_sft" \
-  --name "w_integ_loss_thres_1_p_sat_0.25_sft" \
+  --load_name "use_npc_data_augment_true_use_body_vel_false" \
+  --name "use_npc_data_augment_true_use_body_vel_false" \
   --eval_method "validation" \
   --batch_size 1 \
   --pose_based False \
@@ -214,6 +214,6 @@ taskset -c "${CPUSET}" \
   --do_data_statistics False \
   --use_amortized_diffusion False \
   --use_npc_data_augment False \
-  --use_body_vel True
+  --use_body_vel false
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

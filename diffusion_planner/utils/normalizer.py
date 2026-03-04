@@ -115,6 +115,7 @@ class StateNormalizer:
     @classmethod
     def from_json2(cls, args_dict) -> "StateNormalizer":
         path_str = _pick_normalization_file_path(args_dict)
+        print("path_str: ", path_str, "  ", type(path_str))
         data = openjson(to_absolute_path(path_str))
         mean4 = data["neighbor"]["mean"]
         std4 = data["neighbor"]["std"]
@@ -260,6 +261,7 @@ class ObservationNormalizer:
     @classmethod
     def from_json2(cls, args_dict):
         path_str = _pick_normalization_file_path(args_dict)
+        print("path_str: ", path_str, "  ", type(path_str))
         data = openjson(to_absolute_path(path_str))
 
         ndt = {}
