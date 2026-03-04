@@ -33,7 +33,6 @@ _try_set_oom_score_adj(_oom_adj)
 
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-from diffusion_planner.utils.data_augmentation import StatePerturbation
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 # os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
@@ -86,7 +85,6 @@ from tools.predictor_utils import (
 
 
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
-from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.train_epoch import train_epoch
 import os
 import args_util

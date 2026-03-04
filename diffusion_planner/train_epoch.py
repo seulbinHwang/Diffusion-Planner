@@ -2,11 +2,9 @@ import os
 import numpy as np
 from torch import nn
 from typing import Tuple
-from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.train_utils import get_epoch_mean_loss
 from diffusion_planner.utils import ddp
 from diffusion_planner.loss import diffusion_loss_func
-from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.model.module.feasible import FeasibleProjector
 # =====================================================================
