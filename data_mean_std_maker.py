@@ -831,7 +831,7 @@ def _build_output_mean_std(
             "files_failed": int(files_failed),
             "eps_for_zero_check": float(eps),
             "note": (
-                "one-hot 채널은 정규화하지 않도록 mean=0, std=1로 고정해 저장했습니다."
+                "One-hot channels are not normalized; we store mean=0 and std=1 for them."
             ),
         },
         # agent 계열 4개 key는 같은 mean/std를 쓰도록 출력
