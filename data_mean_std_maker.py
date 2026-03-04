@@ -1100,10 +1100,10 @@ if __name__ == "__main__":
 예시 실행:
 
 python data_mean_std_maker.py \
-  --dataset_dir /workspace/local_shards_v_world \
-  --train_json /workspace/local_shards_v_world/diffusion_planner_training.json \
+  --dataset_dir /workspace/local_shards_v1 \
+  --train_json /workspace/local_shards_v1/diffusion_planner_training.json \
   --only_calculate_statistics \
   --workers 28 \
-  --out_json /workspace/mean_std.json
+  --out_json /workspace/mean_std_v1.json
 
 """
