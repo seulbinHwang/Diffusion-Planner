@@ -4220,30 +4220,51 @@ class FeasibleProjector(nn.Module):
             )  # (B,Pnn,T,3) now treated as body control
 
             if target_current_control is not None:
-                # 현재 시점(prev)도 같은 좌표계라고 보고 body로 맞춰 줌
+                # prev(control)도 world 기준이라고 보고, "이전 세그먼트 mid yaw" 기준으로 body로 변환합니다.
+                # psi_mid_prev ~= psi0 - 0.5 * omega_prev * dt
+
+                # 현재 yaw (cos0, sin0): (B,Pnn)
                 cos0 = unnorm_near_current_state[..., 2].to(device=device,
-                                                            dtype=dtype)  # (B,Pnn)
+                                                            dtype=dtype)
                 sin0 = unnorm_near_current_state[..., 3].to(device=device,
-                                                            dtype=dtype)  # (B,Pnn)
+                                                            dtype=dtype)
                 norm0 = torch.sqrt(cos0 * cos0 + sin0 * sin0 + float(
                     self.constraints_h_params.eps))
                 cos0 = cos0 / norm0
                 sin0 = sin0 / norm0
 
-                tc_w = target_current_control.to(device=device,
-                                                 dtype=dtype)  # (B,Pnn,3)
+                # tc_w: (B,Pnn,3) = [vx_w, vy_w, omega_prev]
+                tc_w = target_current_control.to(device=device, dtype=dtype)
+
+                # (선택) prev_valid가 있으면 무효 행은 0으로 눌러서 안전하게 처리
+                if target_current_control_valid is not None:
+                    prev_valid = self._to_bool_mask(
+                        target_current_control_valid).to(device=device)
+                    tc_w = tc_w.masked_fill(~prev_valid.unsqueeze(-1), 0.0)
+
                 vx_w0 = tc_w[..., 0]  # (B,Pnn)
                 vy_w0 = tc_w[..., 1]  # (B,Pnn)
-                w0 = tc_w[..., 2]  # (B,Pnn)
+                w0 = tc_w[..., 2]  # (B,Pnn)  omega_prev
+
+                # 이전 세그먼트 midpoint: half_delta_theta = -0.5 * omega_prev * dt
+                half_delta_theta = (-0.5) * w0 * float(
+                    self.constraints_h_params.dt)  # (B,Pnn)
+
+                cos_mid_prev, sin_mid_prev = self._compute_mid_heading_from_cos_sin(
+                    cos_yaw_k=cos0,  # (B,Pnn)
+                    sin_yaw_k=sin0,  # (B,Pnn)
+                    half_delta_theta=half_delta_theta,  # (B,Pnn)
+                )  # (B,Pnn), (B,Pnn)
 
                 vx_b0, vy_b0 = self._world_to_body(
                     vx_w=vx_w0,
                     vy_w=vy_w0,
-                    cos_yaw=cos0,
-                    sin_yaw=sin0,
+                    cos_yaw=cos_mid_prev,
+                    sin_yaw=sin_mid_prev,
                 )
-                target_current_control = torch.stack([vx_b0, vy_b0, w0],
-                                                     dim=-1)  # (B,Pnn,3)
+
+                # prev control을 body 기준으로 통일: (B,Pnn,3)
+                target_current_control = torch.stack([vx_b0, vy_b0, w0], dim=-1)
 
         # ==========================================================
 

@@ -2274,6 +2274,207 @@ class Decoder(nn.Module):
         pose_4_dim[..., 2] = torch.where(valid_mask_bool, cos_new, cos_h)
         pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
 
+
+    def _get_rollout_dt_sec(self) -> float:
+        """rollout(세그먼트 적분)에 쓰는 dt(초)를 가져옵니다.
+
+        우선순위:
+            1) feasible_projector가 있으면 그 내부 dt
+            2) config에서 dt / rollout_dt 같은 이름
+            3) 기본값 0.1
+
+        Returns:
+            float: dt (seconds)
+        """
+        # (1) feasible_projector dt 우선
+        fp = getattr(self.dit, "feasible_projector", None)
+        if fp is not None and hasattr(fp, "constraints_h_params"):
+            try:
+                dt_fp = float(fp.constraints_h_params.dt)
+                if dt_fp > 0.0:
+                    return dt_fp
+            except Exception:
+                pass
+
+        # (2) config 쪽 후보
+        for key in ("rollout_dt", "dt", "step_dt"):
+            if hasattr(self.config, key):
+                try:
+                    dt_cfg = float(getattr(self.config, key))
+                    if dt_cfg > 0.0:
+                        return dt_cfg
+                except Exception:
+                    pass
+
+        # (3) fallback
+        return 0.1
+
+    @staticmethod
+    def _rotate_vxy_world_to_new_origin(
+        vx_w: torch.Tensor,  # (B, P, T)
+        vy_w: torch.Tensor,  # (B, P, T)
+        cos_delta: torch.Tensor,  # (B,)
+        sin_delta: torch.Tensor,  # (B,)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """세계(world) 기준 (vx, vy)를 '새 좌표계'로 회전합니다.
+
+        새 좌표계는 기존 좌표계를 yaw_delta 만큼 "빼는" 기준(=R(-yaw_delta))입니다.
+        포인트 변환에 쓰는 회전과 동일한 형태입니다.
+
+        Args:
+            vx_w (torch.Tensor): (B, P, T)
+            vy_w (torch.Tensor): (B, P, T)
+            cos_delta (torch.Tensor): (B,)
+            sin_delta (torch.Tensor): (B,)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                vx_new: (B, P, T)
+                vy_new: (B, P, T)
+        """
+        if vx_w.dim() != 3 or vy_w.dim() != 3:
+            raise ValueError("vx_w/vy_w는 (B,P,T) 3D여야 합니다.")
+        if tuple(vx_w.shape) != tuple(vy_w.shape):
+            raise ValueError("vx_w/vy_w shape이 다릅니다.")
+        if cos_delta.dim() != 1 or sin_delta.dim() != 1:
+            raise ValueError("cos_delta/sin_delta는 (B,) 1D여야 합니다.")
+        if int(cos_delta.shape[0]) != int(vx_w.shape[0]):
+            raise ValueError("cos_delta의 B가 vx_w의 B와 다릅니다.")
+
+        B = int(vx_w.shape[0])
+        cos_b = cos_delta.view(B, 1, 1)
+        sin_b = sin_delta.view(B, 1, 1)
+
+        vx_new = cos_b * vx_w + sin_b * vy_w
+        vy_new = (-sin_b) * vx_w + cos_b * vy_w
+        return vx_new, vy_new
+
+    def _update_diffusion_future_control_sequence_origin(
+        self,
+        diffusion_future_control_norm: torch.Tensor,  # (B, (1+)Pnn, T, 3)
+        rollout_time_chunk_size: int,
+        target_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, 1+T) bool/0-1
+    ) -> torch.Tensor:
+        """pose_based=False + use_body_vel=False amortized에서 미래 control의 좌표계를 다음 step 기준으로 맞춥니다.
+
+        전제:
+            - diffusion_future_control_norm[..., 0:2] = (vx_world, vy_world) (정규화된 값)
+            - diffusion_future_control_norm[..., 2]   = omega (정규화된 값)
+            - 롤아웃 파이프라인이 매 step "새 ego 기준"으로 좌표(방향 포함)를 갱신한다면,
+              버퍼에 남겨 재사용할 미래 control도 같은 기준으로 회전되어야 합니다.
+
+        방법:
+            1) 미래 control을 unnorm으로 되돌립니다.
+            2) ego(인덱스 0)의 omega를 gap 만큼 적분해서 yaw_delta를 구합니다.
+               - yaw_delta[b] = sum_{k=0..gap-1} omega_ego[b,k] * dt
+            3) 모든 에이전트의 (vx, vy)에 R(-yaw_delta)를 적용합니다. omega는 그대로 둡니다.
+            4) 다시 norm으로 되돌리고, 무효 구간은 0으로 고정합니다.
+
+        Args:
+            diffusion_future_control_norm (torch.Tensor):
+                shape: (B, (1+)Pnn, T, 3)
+            rollout_time_chunk_size (int):
+                gap. 실행되는 세그먼트 개수.
+            target_cur_future_valid (torch.Tensor):
+                현재+미래 노드 valid.
+                shape: (B, (1+)Pnn, 1+T)
+
+        Returns:
+            torch.Tensor:
+                다음 step 기준으로 회전된 미래 control (정규화).
+                shape: (B, (1+)Pnn, T, 3)
+        """
+        # 조건이 맞을 때만 동작 (안전)
+        if bool(getattr(self.config, "pose_based", False)):
+            return diffusion_future_control_norm
+        if bool(getattr(self.config, "use_body_vel", True)):
+            return diffusion_future_control_norm
+        if not bool(getattr(self.config, "do_ego_predict", True)):
+            # ego가 없으면(ego 인덱스 정의가 애매하면) 건드리지 않음
+            return diffusion_future_control_norm
+
+        if diffusion_future_control_norm.dim() != 4 or int(diffusion_future_control_norm.shape[-1]) != 3:
+            raise ValueError(
+                "diffusion_future_control_norm은 (B,(1+)Pnn,T,3)이어야 합니다. "
+                f"got {tuple(diffusion_future_control_norm.shape)}"
+            )
+        if target_cur_future_valid.dim() != 3:
+            raise ValueError(
+                "target_cur_future_valid는 (B,(1+)Pnn,1+T) 3D여야 합니다. "
+                f"got {tuple(target_cur_future_valid.shape)}"
+            )
+
+        B = int(diffusion_future_control_norm.shape[0])
+        P = int(diffusion_future_control_norm.shape[1])
+        T = int(diffusion_future_control_norm.shape[2])
+
+        if int(target_cur_future_valid.shape[0]) != B or int(target_cur_future_valid.shape[1]) != P:
+            raise ValueError("target_cur_future_valid의 (B,P)가 control과 다릅니다.")
+        if int(target_cur_future_valid.shape[2]) < int(T + 1):
+            raise ValueError(
+                "target_cur_future_valid의 time 길이가 1+T보다 짧습니다. "
+                f"valid_len={int(target_cur_future_valid.shape[2])}, T={T}"
+            )
+
+        gap = int(rollout_time_chunk_size)
+        if gap <= 0:
+            return diffusion_future_control_norm
+        if gap > T:
+            gap = T
+
+        # seg_valid: (B,P,T)
+        cur_future_valid_bool = _to_bool_mask(target_cur_future_valid[..., -(T + 1):]).to(
+            device=diffusion_future_control_norm.device, dtype=torch.bool
+        )  # (B,P,1+T)
+        seg_valid = cur_future_valid_bool[..., :-1] & cur_future_valid_bool[..., 1:]  # (B,P,T)
+
+        # 1) unnorm control: (B,P,T,3)
+        ctrl_unnorm = self.config.state_normalizer.inverse(
+            data=diffusion_future_control_norm,
+            valid_mask=seg_valid,
+        )
+
+        # 2) ego yaw_delta from omega (unnorm)
+        dt = float(self._get_rollout_dt_sec())
+        omega_ego = ctrl_unnorm[:, 0, :gap, 2].to(dtype=torch.float32)  # (B,gap)
+
+        # (선택) seg_valid로 한 번 더 안전 마스킹 (ego)
+        ego_seg_valid = seg_valid[:, 0, :gap].to(dtype=torch.float32)  # (B,gap)
+        omega_ego = omega_ego * ego_seg_valid
+
+        yaw_delta = (omega_ego * dt).sum(dim=1)  # (B,)
+        cos_delta = torch.cos(yaw_delta)  # (B,)
+        sin_delta = torch.sin(yaw_delta)  # (B,)
+
+        # 3) rotate (vx,vy) for all agents
+        vx_w = ctrl_unnorm[..., 0].to(dtype=torch.float32)  # (B,P,T)
+        vy_w = ctrl_unnorm[..., 1].to(dtype=torch.float32)  # (B,P,T)
+        omega = ctrl_unnorm[..., 2].to(dtype=torch.float32)  # (B,P,T)
+
+        vx_new, vy_new = self._rotate_vxy_world_to_new_origin(
+            vx_w=vx_w,
+            vy_w=vy_w,
+            cos_delta=cos_delta.to(device=vx_w.device, dtype=vx_w.dtype),
+            sin_delta=sin_delta.to(device=vx_w.device, dtype=vx_w.dtype),
+        )
+
+        ctrl_rot_unnorm = torch.stack([vx_new, vy_new, omega], dim=-1)  # (B,P,T,3)
+
+        # 4) back to norm + invalid=0
+        ctrl_rot_norm = self.config.state_normalizer(
+            data=ctrl_rot_unnorm.to(dtype=ctrl_unnorm.dtype, device=ctrl_unnorm.device),
+            valid_mask=seg_valid,
+        )
+        ctrl_rot_norm = ctrl_rot_norm.masked_fill(~seg_valid.unsqueeze(-1), 0.0)
+
+        # dtype/device 원복
+        ctrl_rot_norm = ctrl_rot_norm.to(
+            device=diffusion_future_control_norm.device,
+            dtype=diffusion_future_control_norm.dtype,
+        ).detach()
+
+        return ctrl_rot_norm
+
     def _update_diffusion_future_sequence_origin(
             self,
             diffusion_future_sequence: torch.Tensor,  # (B, 1+Pnn, T, 4 or 3)
@@ -2543,6 +2744,10 @@ class Decoder(nn.Module):
                 target_future_valid = target_past_cur_future_valid[:, :, -self.
                                                                    _future_len:].detach(
                                                                    )
+                # ✅ (추가) 현재+미래 노드 valid: (B, (1+)Pnn, 1+T)
+                target_cur_future_valid = target_past_cur_future_valid[
+                    :, :, -(1 + self._future_len):].detach()
+
                 # ✅ 미래 버퍼도 다음 스텝 기준 좌표로 맞추기
                 if self.config.pose_based:
                     diffusion_future_sequence = self._update_diffusion_future_sequence_origin(
@@ -2550,6 +2755,17 @@ class Decoder(nn.Module):
                         rollout_time_chunk_size=rollout_time_chunk_size_int,
                         target_future_valid=target_future_valid,
                     )
+                else:
+                    # ✅ (핵심) pose_based=False + use_body_vel=False 인 경우,
+                    #          (vx,vy)를 다음 step 기준으로 회전해서 버퍼에 저장
+                    if not bool(getattr(self.config, "use_body_vel", True)):
+                        diffusion_future_sequence = self._update_diffusion_future_control_sequence_origin(
+                            diffusion_future_control_norm=diffusion_future_sequence,
+                            # (B,(1+)Pnn,T,3)
+                            rollout_time_chunk_size=rollout_time_chunk_size_int,
+                            target_cur_future_valid=target_cur_future_valid,
+                            # (B,(1+)Pnn,1+T)
+                        )
                 tail = inputs.get("amortized_random_noise_tail", None)
                 if (inputs.get("inference_noise", None)
                         is not None) and isinstance(tail, torch.Tensor):

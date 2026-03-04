@@ -29,7 +29,6 @@ CONTROL_FRAME_KEY = "seg_control_use_body_vel"
 # control 관련 키들(샘플 파생키와 구분하기 위해)
 _CONTROL_KEYS = (PAST_CONTROL_KEY, FUTURE_CONTROL_KEY, CONTROL_FRAME_KEY)
 
-
 _WORKER_CONFIG: Dict[str, Any] = {}
 
 
@@ -47,7 +46,8 @@ def _to_bool_scalar(value: Any) -> bool:
     """
     arr = np.asarray(value)
     if arr.size != 1:
-        raise ValueError(f"bool scalar여야 합니다. got shape={arr.shape}, size={arr.size}")
+        raise ValueError(
+            f"bool scalar여야 합니다. got shape={arr.shape}, size={arr.size}")
 
     v = arr.reshape(()).item()
     if isinstance(v, (bool, np.bool_)):
@@ -57,6 +57,7 @@ def _to_bool_scalar(value: Any) -> bool:
     if isinstance(v, (float, np.floating)):
         return bool(float(v))
     raise ValueError(f"bool로 변환할 수 없는 타입입니다. got type={type(v)}")
+
 
 def _str2bool(v: Union[str, bool]) -> bool:
     """문자열로 들어오는 True/False를 bool로 바꿉니다.
@@ -78,7 +79,9 @@ def _str2bool(v: Union[str, bool]) -> bool:
         return True
     if s in ("0", "false", "f", "no", "n"):
         return False
-    raise argparse.ArgumentTypeError(f"use_body_vel은 true/false(또는 1/0)로 입력해 주세요. got={v}")
+    raise argparse.ArgumentTypeError(
+        f"use_body_vel은 true/false(또는 1/0)로 입력해 주세요. got={v}")
+
 
 class ControlStatsAccumulator:
     """(v_x^b, v_y^b, yaw_rate) mean/std 계산을 위한 누적기입니다.
@@ -95,8 +98,10 @@ class ControlStatsAccumulator:
 
     def __init__(self) -> None:
         self.count: int = 0
-        self.sum: NDArray[np.float64] = np.zeros((3,), dtype=np.float64)    # (3,)
-        self.sumsq: NDArray[np.float64] = np.zeros((3,), dtype=np.float64)  # (3,)
+        self.sum: NDArray[np.float64] = np.zeros((3, ),
+                                                 dtype=np.float64)  # (3,)
+        self.sumsq: NDArray[np.float64] = np.zeros((3, ),
+                                                   dtype=np.float64)  # (3,)
 
     def update(self, values: np.ndarray) -> None:
         """유효한 값들을 누적합니다.
@@ -127,8 +132,8 @@ class ControlStatsAccumulator:
             return
 
         self.count += int(v_sel.shape[0])
-        self.sum += v_sel.sum(axis=0)             # (3,)
-        self.sumsq += (v_sel * v_sel).sum(axis=0) # (3,)
+        self.sum += v_sel.sum(axis=0)  # (3,)
+        self.sumsq += (v_sel * v_sel).sum(axis=0)  # (3,)
 
     def merge(self, other: "ControlStatsAccumulator") -> None:
         """다른 누적기의 값을 합칩니다.
@@ -140,7 +145,8 @@ class ControlStatsAccumulator:
             None
         """
         if not isinstance(other, ControlStatsAccumulator):
-            raise ValueError(f"other는 ControlStatsAccumulator 이어야 합니다. got={type(other)}")
+            raise ValueError(
+                f"other는 ControlStatsAccumulator 이어야 합니다. got={type(other)}")
         self.count += int(other.count)
         self.sum += np.asarray(other.sum, dtype=np.float64)
         self.sumsq += np.asarray(other.sumsq, dtype=np.float64)
@@ -165,10 +171,11 @@ class ControlStatsAccumulator:
             None
         """
         self.count += int(count)
-        self.sum += np.asarray(sum_list, dtype=np.float64).reshape((3,))
-        self.sumsq += np.asarray(sumsq_list, dtype=np.float64).reshape((3,))
+        self.sum += np.asarray(sum_list, dtype=np.float64).reshape((3, ))
+        self.sumsq += np.asarray(sumsq_list, dtype=np.float64).reshape((3, ))
 
-    def compute_mean_std(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    def compute_mean_std(
+            self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
         """누적된 값으로 mean/std를 계산합니다.
 
         Returns:
@@ -177,12 +184,12 @@ class ControlStatsAccumulator:
                 - std:  shape (3,)
         """
         if int(self.count) <= 0:
-            nan3 = np.full((3,), np.nan, dtype=np.float64)
+            nan3 = np.full((3, ), np.nan, dtype=np.float64)
             return nan3, nan3
 
         n = float(self.count)
-        mean = self.sum / n                      # (3,)
-        var = (self.sumsq / n) - (mean * mean)   # (3,)
+        mean = self.sum / n  # (3,)
+        var = (self.sumsq / n) - (mean * mean)  # (3,)
 
         # 수치 오차로 -0.xx 가 나오는 것을 방지
         var = np.maximum(var, 0.0)
@@ -257,12 +264,12 @@ def _worker_process_one_fname(fname: str) -> Tuple[str, bool, str, bool]:
             keys = None
         use_body_vel = bool(cfg["use_body_vel"])
         if _is_already_processed_npz(
-            npz_path,
-            overwrite=overwrite,
-            add_sample_keys=add_sample_keys,
-            overwrite_sample_keys=overwrite_sample_keys,
-            use_agent_route_lane_order=use_agent_route_lane_order,
-            existing_keys=keys,
+                npz_path,
+                overwrite=overwrite,
+                add_sample_keys=add_sample_keys,
+                overwrite_sample_keys=overwrite_sample_keys,
+                use_agent_route_lane_order=use_agent_route_lane_order,
+                existing_keys=keys,
                 use_body_vel=use_body_vel,
         ):
             return str(fname), True, "skip(already processed)", True
@@ -285,7 +292,9 @@ def _worker_process_one_fname(fname: str) -> Tuple[str, bool, str, bool]:
     except Exception as e:
         return str(fname), False, f"{type(e).__name__}: {e}", False
 
-def _load_npz_subset_as_dict(npz_path: str, keys: Sequence[str]) -> Dict[str, np.ndarray]:
+
+def _load_npz_subset_as_dict(npz_path: str,
+                             keys: Sequence[str]) -> Dict[str, np.ndarray]:
     """npz에서 '필요한 key들만' 골라서 dict로 읽습니다.
 
     Args:
@@ -348,7 +357,8 @@ def _atomic_update_npz_by_copy_and_append(
         # 1) 원본을 그대로 복사 (기존 데이터는 재압축/재저장 안 함)
         shutil.copyfile(npz_path, tmp_path)
 
-        compression = zipfile.ZIP_DEFLATED if bool(compress) else zipfile.ZIP_STORED
+        compression = zipfile.ZIP_DEFLATED if bool(
+            compress) else zipfile.ZIP_STORED
 
         zip_kwargs: Dict[str, Any] = {"mode": "a", "compression": compression}
         if bool(compress):
@@ -477,23 +487,23 @@ def _build_expected_keys_for_done(
     Returns:
         set[str]: 완료 판정에 필요한 key 이름 집합.
     """
-    expected: set[str] = {PAST_CONTROL_KEY, FUTURE_CONTROL_KEY,
-                          CONTROL_FRAME_KEY}
+    expected: set[str] = {
+        PAST_CONTROL_KEY, FUTURE_CONTROL_KEY, CONTROL_FRAME_KEY
+    }
     if not bool(add_sample_keys):
         return expected
 
     # sample 파생키 모드에서 "항상" 추가되는 것들
-    expected.update(
-        {
-            "scenario_id",
-        }
-    )
+    expected.update({
+        "scenario_id",
+    })
 
     # --- validity 관련(입력 key가 있을 때만 저장되는 것들) ---
     validity_by_source: Dict[str, List[str]] = {
         "ego_agent_past": ["ego_agent_past_is_valid"],
         "ego_future_gt_11_dim": ["ego_future_gt_is_valid"],
-        "neighbor_agents_past": ["neighbor_agents_past_is_valid", "neighbor_agents_is_valid"],
+        "neighbor_agents_past":
+        ["neighbor_agents_past_is_valid", "neighbor_agents_is_valid"],
         "neighbor_future_gt_11_dim": ["neighbor_future_gt_is_valid"],
         "stop_sign_points": ["stop_sign_is_valid"],
         "crosswalk_points": ["crosswalk_is_valid"],
@@ -508,41 +518,42 @@ def _build_expected_keys_for_done(
         if src_key in existing_keys:
             expected.update(out_keys)
 
-    if bool(use_agent_route_lane_order) and ("agent_route_lane_order" in existing_keys):
+    if bool(use_agent_route_lane_order) and ("agent_route_lane_order"
+                                             in existing_keys):
         expected.add("agent_route_lane_order_is_valid")
 
     # --- near split 관련(입력 key가 있을 때만 저장되는 것들) ---
     if "neighbor_agents_past" in existing_keys:
-        expected.update(
-            {
-                "near_agents_past",
-                "non_near_agents_past",
-                "near_agents_past_is_valid",
-                "non_near_agents_past_is_valid",
-                "near_agents_is_valid",
-                "non_near_agents_is_valid",
-            }
-        )
+        expected.update({
+            "near_agents_past",
+            "non_near_agents_past",
+            "near_agents_past_is_valid",
+            "non_near_agents_past_is_valid",
+            "near_agents_is_valid",
+            "non_near_agents_is_valid",
+        })
 
     if "neighbor_future_gt_11_dim" in existing_keys:
-        expected.update(
-            {
-                "near_future_gt_is_valid",
-                "non_near_future_gt_is_valid",
-            }
-        )
+        expected.update({
+            "near_future_gt_is_valid",
+            "non_near_future_gt_is_valid",
+        })
 
     if "neighbor_future_gt_3_dim" in existing_keys:
         expected.add("near_future_gt_3_dim")
 
     # --- gt_4_dim 관련(입력 key가 있을 때만 저장되는 것들) ---
-    if ("ego_future_gt_3_dim" in existing_keys) and ("ego_future_gt_11_dim" in existing_keys):
+    if ("ego_future_gt_3_dim" in existing_keys) and ("ego_future_gt_11_dim"
+                                                     in existing_keys):
         expected.add("ego_future_gt_4_dim")
 
-    if ("neighbor_future_gt_3_dim" in existing_keys) and ("neighbor_future_gt_11_dim" in existing_keys):
+    if ("neighbor_future_gt_3_dim"
+            in existing_keys) and ("neighbor_future_gt_11_dim"
+                                   in existing_keys):
         expected.add("near_future_gt_4_dim")
 
     return expected
+
 
 # --------------------
 # [3] past/future control 생성 함수 추가(기존 past_future 관련 함수는 더 이상 사용 안 해도 됨)
@@ -563,9 +574,12 @@ def _build_seg_control_gt_and_seg_valid_from_all11(
     if ego11.ndim != 2 or int(ego11.shape[-1]) != 11:
         raise ValueError(f"ego_all11 shape는 (T,11) 이어야 합니다. got {ego11.shape}")
     if nbr11.ndim != 3 or int(nbr11.shape[-1]) != 11:
-        raise ValueError(f"neighbor_all11 shape는 (N,T,11) 이어야 합니다. got {nbr11.shape}")
+        raise ValueError(
+            f"neighbor_all11 shape는 (N,T,11) 이어야 합니다. got {nbr11.shape}")
     if int(nbr11.shape[1]) != int(ego11.shape[0]):
-        raise ValueError(f"T 차원이 일치해야 합니다. got ego T={ego11.shape[0]} vs nbr T={nbr11.shape[1]}")
+        raise ValueError(
+            f"T 차원이 일치해야 합니다. got ego T={ego11.shape[0]} vs nbr T={nbr11.shape[1]}"
+        )
 
     T = int(ego11.shape[0])
     if T <= 1:
@@ -579,9 +593,11 @@ def _build_seg_control_gt_and_seg_valid_from_all11(
     if cur_idx < 0:
         cur_idx += T
     if not (0 <= cur_idx < T):
-        raise ValueError(f"current_index 범위가 잘못되었습니다. got {current_index}, T={T}")
+        raise ValueError(
+            f"current_index 범위가 잘못되었습니다. got {current_index}, T={T}")
 
-    ego11 = ego11.astype(np.float32 if ego11.dtype.kind != "f" else ego11.dtype, copy=False)
+    ego11 = ego11.astype(
+        np.float32 if ego11.dtype.kind != "f" else ego11.dtype, copy=False)
     nbr11 = nbr11.astype(ego11.dtype, copy=False)
 
     ego_cur_valid = bool((np.abs(ego11[cur_idx, :8]) > eps).any())
@@ -590,20 +606,24 @@ def _build_seg_control_gt_and_seg_valid_from_all11(
 
     N = int(nbr11.shape[0])
     if N > 0:
-        nbr_cur_valid_mask = (np.abs(nbr11[:, cur_idx, :8]) > eps).any(axis=1)  # (N,)
+        nbr_cur_valid_mask = (np.abs(nbr11[:, cur_idx, :8])
+                              > eps).any(axis=1)  # (N,)
         if not np.all(nbr_cur_valid_mask):
             nbr11 = np.array(nbr11, copy=True)
             nbr11[~nbr_cur_valid_mask, :, :] = 0.0
 
     ego_pose3 = _traj11_to_traj3_heading(ego11)  # (T,3)
     nbr_pose3 = _traj11_to_traj3_heading(nbr11)  # (N,T,3)
-    all_pose3 = np.concatenate([ego_pose3[None, ...], nbr_pose3], axis=0).astype(np.float32, copy=False)
+    all_pose3 = np.concatenate([ego_pose3[None, ...], nbr_pose3],
+                               axis=0).astype(np.float32, copy=False)
     # all_pose3: (1+N, T, 3)
 
-    ego_valid = (np.abs(ego11[:, :8]) > eps).any(axis=1)            # (T,)
-    nbr_valid = (np.abs(nbr11[:, :, :8]) > eps).any(axis=2)         # (N,T)
-    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N,T)
-    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)  # (1+N,T-1)
+    ego_valid = (np.abs(ego11[:, :8]) > eps).any(axis=1)  # (T,)
+    nbr_valid = (np.abs(nbr11[:, :, :8]) > eps).any(axis=2)  # (N,T)
+    all_valid = np.concatenate([ego_valid[None, :], nbr_valid],
+                               axis=0).astype(bool)  # (1+N,T)
+    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(
+        bool)  # (1+N,T-1)
 
     controls = differentiate_numpy_pose3_to_control3(
         all_pose3,
@@ -628,22 +648,26 @@ def _build_past_seg_control_gt_and_seg_valid_from_npz_arrays(
     nbr_past = np.asarray(neighbor_agents_past)
 
     if ego_past.ndim != 2 or ego_past.shape[-1] != 11:
-        raise ValueError(f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
+        raise ValueError(
+            f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
     if nbr_past.ndim != 3 or nbr_past.shape[-1] != 11:
-        raise ValueError(f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}")
+        raise ValueError(
+            f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}"
+        )
     if int(nbr_past.shape[1]) != int(ego_past.shape[0]):
-        raise ValueError(f"Tp 차원이 일치해야 합니다. got ego Tp={ego_past.shape[0]} vs nbr Tp={nbr_past.shape[1]}")
+        raise ValueError(
+            f"Tp 차원이 일치해야 합니다. got ego Tp={ego_past.shape[0]} vs nbr Tp={nbr_past.shape[1]}"
+        )
 
     Tp = int(ego_past.shape[0])
     return _build_seg_control_gt_and_seg_valid_from_all11(
-        ego_all11=ego_past,                 # (Tp,11)
-        neighbor_all11=nbr_past,            # (N,Tp,11)
+        ego_all11=ego_past,  # (Tp,11)
+        neighbor_all11=nbr_past,  # (N,Tp,11)
         current_index=Tp - 1,
         dt=float(dt),
         use_body_vel=bool(use_body_vel),
         eps=float(eps),
     )
-
 
 
 def _build_future_seg_control_gt_and_seg_valid_from_npz_arrays(
@@ -663,13 +687,19 @@ def _build_future_seg_control_gt_and_seg_valid_from_npz_arrays(
     nbr_fut = np.asarray(neighbor_future_gt_11_dim)
 
     if ego_past.ndim != 2 or ego_past.shape[-1] != 11:
-        raise ValueError(f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
+        raise ValueError(
+            f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
     if ego_fut.ndim != 2 or ego_fut.shape[-1] != 11:
-        raise ValueError(f"ego_future_gt_11_dim shape는 (Tf,11)이어야 합니다. got {ego_fut.shape}")
+        raise ValueError(
+            f"ego_future_gt_11_dim shape는 (Tf,11)이어야 합니다. got {ego_fut.shape}")
     if nbr_past.ndim != 3 or nbr_past.shape[-1] != 11:
-        raise ValueError(f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}")
+        raise ValueError(
+            f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}"
+        )
     if nbr_fut.ndim != 3 or nbr_fut.shape[-1] != 11:
-        raise ValueError(f"neighbor_future_gt_11_dim shape는 (N,Tf,11)이어야 합니다. got {nbr_fut.shape}")
+        raise ValueError(
+            f"neighbor_future_gt_11_dim shape는 (N,Tf,11)이어야 합니다. got {nbr_fut.shape}"
+        )
 
     Tp = int(ego_past.shape[0])
     Tf = int(ego_fut.shape[0])
@@ -678,11 +708,17 @@ def _build_future_seg_control_gt_and_seg_valid_from_npz_arrays(
     if Tp <= 0:
         raise ValueError(f"Tp는 1 이상이어야 합니다. got Tp={Tp}")
     if int(nbr_past.shape[1]) != Tp:
-        raise ValueError(f"neighbor_agents_past의 Tp가 ego와 같아야 합니다. got {nbr_past.shape[1]} vs {Tp}")
+        raise ValueError(
+            f"neighbor_agents_past의 Tp가 ego와 같아야 합니다. got {nbr_past.shape[1]} vs {Tp}"
+        )
     if int(nbr_fut.shape[0]) != N:
-        raise ValueError(f"neighbor_future_gt_11_dim의 N이 neighbor_agents_past와 같아야 합니다. got {nbr_fut.shape[0]} vs {N}")
+        raise ValueError(
+            f"neighbor_future_gt_11_dim의 N이 neighbor_agents_past와 같아야 합니다. got {nbr_fut.shape[0]} vs {N}"
+        )
     if int(nbr_fut.shape[1]) != Tf:
-        raise ValueError(f"neighbor_future_gt_11_dim의 Tf가 ego_future와 같아야 합니다. got {nbr_fut.shape[1]} vs {Tf}")
+        raise ValueError(
+            f"neighbor_future_gt_11_dim의 Tf가 ego_future와 같아야 합니다. got {nbr_fut.shape[1]} vs {Tf}"
+        )
 
     ego_cur = ego_past[-1:, :]  # (1,11)
     ego_all11 = np.concatenate([ego_cur, ego_fut], axis=0)  # (1+Tf,11)
@@ -703,8 +739,6 @@ def _build_future_seg_control_gt_and_seg_valid_from_npz_arrays(
     )
 
 
-
-
 def build_past_seg_control_gt_3_dim_from_npz_arrays(
     ego_agent_past: ArrayF,  # (Tp,11)
     neighbor_agents_past: ArrayF,  # (N,Tp,11)
@@ -723,7 +757,6 @@ def build_past_seg_control_gt_3_dim_from_npz_arrays(
     )
     controls[~seg_valid] = 0.0
     return controls
-
 
 
 def build_future_seg_control_gt_3_dim_from_npz_arrays(
@@ -786,7 +819,8 @@ def _is_already_processed_npz(
 
     # control frame 메타 값이 현재 실행 옵션과 같은지도 확인
     try:
-        meta = _load_npz_subset_as_dict(npz_path, [CONTROL_FRAME_KEY]).get(CONTROL_FRAME_KEY, None)
+        meta = _load_npz_subset_as_dict(npz_path, [CONTROL_FRAME_KEY]).get(
+            CONTROL_FRAME_KEY, None)
         if meta is None:
             return False
         stored_use_body_vel = _to_bool_scalar(meta)
@@ -855,15 +889,14 @@ def _maybe_print_progress_every_5_min(
     remaining_files = max(int(total - processed), 0)
     remaining_s = avg_s_per_file * float(remaining_files)
 
-    tqdm.write(
-        f"[진행] {pct:.2f}% ({processed}/{total}) | "
-        f"경과 {_format_seconds_to_hh_mm(elapsed_s)} | "
-        f"남은시간(예상) {_format_seconds_to_hh_mm(remaining_s)}"
-    )
+    tqdm.write(f"[진행] {pct:.2f}% ({processed}/{total}) | "
+               f"경과 {_format_seconds_to_hh_mm(elapsed_s)} | "
+               f"남은시간(예상) {_format_seconds_to_hh_mm(remaining_s)}")
     return now
 
 
-def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
+def _to_scalar_dt(value: Union[float, np.ndarray],
+                  ref: NDArray[np.generic]) -> np.floating:
     """dt를 ref와 같은 dtype의 스칼라로 정리합니다.
 
     Args:
@@ -883,7 +916,8 @@ def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> 
     """
     dt_arr = np.asarray(value, dtype=ref.dtype)
     if dt_arr.size != 1:
-        raise ValueError(f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
+        raise ValueError(
+            f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
     return dt_arr.reshape(()).item()
 
 
@@ -896,10 +930,12 @@ def _wrap_to_pi(delta: ArrayF) -> ArrayF:
     Returns:
         np.ndarray: (-pi, pi] 범위로 접힌 각도 차이. shape는 입력과 동일.
     """
-    return np.arctan2(np.sin(delta), np.cos(delta)).astype(delta.dtype, copy=False)
+    return np.arctan2(np.sin(delta), np.cos(delta)).astype(delta.dtype,
+                                                           copy=False)
 
 
-def _normalize_cos_sin(cos_seq: ArrayF, sin_seq: ArrayF, eps: float) -> Tuple[ArrayF, ArrayF]:
+def _normalize_cos_sin(cos_seq: ArrayF, sin_seq: ArrayF,
+                       eps: float) -> Tuple[ArrayF, ArrayF]:
     """(cos, sin) 쌍을 길이 1이 되도록 정리합니다.
 
     Args:
@@ -911,8 +947,11 @@ def _normalize_cos_sin(cos_seq: ArrayF, sin_seq: ArrayF, eps: float) -> Tuple[Ar
         Tuple[np.ndarray, np.ndarray]:
             (cos_norm, sin_norm) - 입력과 동일한 shape
     """
-    r = np.sqrt(cos_seq * cos_seq + sin_seq * sin_seq + eps).astype(cos_seq.dtype, copy=False)
-    return (cos_seq / r).astype(cos_seq.dtype, copy=False), (sin_seq / r).astype(sin_seq.dtype, copy=False)
+    r = np.sqrt(cos_seq * cos_seq + sin_seq * sin_seq + eps).astype(
+        cos_seq.dtype, copy=False)
+    return (cos_seq / r).astype(
+        cos_seq.dtype, copy=False), (sin_seq / r).astype(sin_seq.dtype,
+                                                         copy=False)
 
 
 def differentiate_numpy_pose3_to_control3(
@@ -943,18 +982,18 @@ def differentiate_numpy_pose3_to_control3(
     """
     pose = np.asarray(cur_future_pose_gt_3_dim)
     if pose.ndim != 3 or int(pose.shape[-1]) != 3:
-        raise ValueError(
-            "cur_future_pose_gt_3_dim은 (P, 1+T, 3) 3D 배열이어야 합니다. "
-            f"got shape={pose.shape}"
-        )
+        raise ValueError("cur_future_pose_gt_3_dim은 (P, 1+T, 3) 3D 배열이어야 합니다. "
+                         f"got shape={pose.shape}")
 
     # float dtype 강제(삼각함수/나눗셈 안정)
-    pose = pose.astype(np.float32 if pose.dtype.kind != "f" else pose.dtype, copy=False)
+    pose = pose.astype(np.float32 if pose.dtype.kind != "f" else pose.dtype,
+                       copy=False)
 
     _, time_len, _ = pose.shape
     T = int(time_len - 1)
     if T <= 0:
-        raise ValueError(f"time_len(=1+T)은 최소 2여야 합니다. got time_len={time_len}")
+        raise ValueError(
+            f"time_len(=1+T)은 최소 2여야 합니다. got time_len={time_len}")
 
     dt_s = _to_scalar_dt(dt, ref=pose)
     if (not np.isfinite(dt_s)) or float(dt_s) <= 0.0:
@@ -982,20 +1021,24 @@ def differentiate_numpy_pose3_to_control3(
 
     if not bool(use_body_vel):
         # (P, T, 3)
-        return np.stack([vwx, vwy, omega], axis=-1).astype(pose.dtype, copy=False)
+        return np.stack([vwx, vwy, omega], axis=-1).astype(pose.dtype,
+                                                           copy=False)
 
     # 3) 몸체 좌표계로 회전(중간 heading 사용)
     th_mid = (th0 + 0.5 * delta_theta).astype(pose.dtype, copy=False)  # (P, T)
-    cos_mid = np.cos(th_mid).astype(pose.dtype, copy=False)            # (P, T)
-    sin_mid = np.sin(th_mid).astype(pose.dtype, copy=False)            # (P, T)
+    cos_mid = np.cos(th_mid).astype(pose.dtype, copy=False)  # (P, T)
+    sin_mid = np.sin(th_mid).astype(pose.dtype, copy=False)  # (P, T)
 
     if normalize_yaw:
         cos_mid, sin_mid = _normalize_cos_sin(cos_mid, sin_mid, eps=float(eps))
 
-    vx_b = (cos_mid * vwx + sin_mid * vwy).astype(pose.dtype, copy=False)     # (P, T)
-    vy_b = (-sin_mid * vwx + cos_mid * vwy).astype(pose.dtype, copy=False)   # (P, T)
+    vx_b = (cos_mid * vwx + sin_mid * vwy).astype(pose.dtype,
+                                                  copy=False)  # (P, T)
+    vy_b = (-sin_mid * vwx + cos_mid * vwy).astype(pose.dtype,
+                                                   copy=False)  # (P, T)
 
-    return np.stack([vx_b, vy_b, omega], axis=-1).astype(pose.dtype, copy=False)
+    return np.stack([vx_b, vy_b, omega], axis=-1).astype(pose.dtype,
+                                                         copy=False)
 
 
 def _traj11_to_traj3_heading(traj_11: ArrayF) -> ArrayF:
@@ -1015,13 +1058,17 @@ def _traj11_to_traj3_heading(traj_11: ArrayF) -> ArrayF:
     if arr.ndim == 2:
         if arr.shape[-1] != 11:
             raise ValueError(f"traj_11 마지막 차원은 11이어야 합니다. got {arr.shape}")
-        heading = np.arctan2(arr[:, 3], arr[:, 2]).astype(np.float32, copy=False)
-        return np.stack([arr[:, 0], arr[:, 1], heading], axis=-1).astype(np.float32, copy=False)
+        heading = np.arctan2(arr[:, 3], arr[:, 2]).astype(np.float32,
+                                                          copy=False)
+        return np.stack([arr[:, 0], arr[:, 1], heading],
+                        axis=-1).astype(np.float32, copy=False)
     if arr.ndim == 3:
         if arr.shape[-1] != 11:
             raise ValueError(f"traj_11 마지막 차원은 11이어야 합니다. got {arr.shape}")
-        heading = np.arctan2(arr[:, :, 3], arr[:, :, 2]).astype(np.float32, copy=False)
-        return np.stack([arr[:, :, 0], arr[:, :, 1], heading], axis=-1).astype(np.float32, copy=False)
+        heading = np.arctan2(arr[:, :, 3], arr[:, :, 2]).astype(np.float32,
+                                                                copy=False)
+        return np.stack([arr[:, :, 0], arr[:, :, 1], heading],
+                        axis=-1).astype(np.float32, copy=False)
     raise ValueError(f"traj_11은 (T,11) 또는 (N,T,11) 이어야 합니다. got {arr.shape}")
 
 
@@ -1047,10 +1094,12 @@ def _get_ego_cur_future_gt_3_dim(
     cur4 = np.asarray(ego_current_4_dim).astype(np.float32, copy=False)
     fut3 = np.asarray(ego_future_gt_3_dim).astype(np.float32, copy=False)
 
-    if cur4.shape != (4,):
-        raise ValueError(f"ego_current_4_dim shape는 (4,) 이어야 합니다. got {cur4.shape}")
+    if cur4.shape != (4, ):
+        raise ValueError(
+            f"ego_current_4_dim shape는 (4,) 이어야 합니다. got {cur4.shape}")
     if fut3.ndim != 2 or fut3.shape[-1] != 3:
-        raise ValueError(f"ego_future_gt_3_dim shape는 (Tf,3) 이어야 합니다. got {fut3.shape}")
+        raise ValueError(
+            f"ego_future_gt_3_dim shape는 (Tf,3) 이어야 합니다. got {fut3.shape}")
 
     Tf = int(fut3.shape[0])
     out = np.zeros((1 + Tf, 3), dtype=np.float32)
@@ -1088,15 +1137,21 @@ def _get_neighbor_cur_future_gt_3_dim(
     Returns:
         np.ndarray: shape (N, 1+Tf, 3)
     """
-    cur4 = np.asarray(neighbor_agents_current_4_dim).astype(np.float32, copy=False)
+    cur4 = np.asarray(neighbor_agents_current_4_dim).astype(np.float32,
+                                                            copy=False)
     fut3 = np.asarray(neighbor_future_gt_3_dim).astype(np.float32, copy=False)
 
     if cur4.ndim != 2 or cur4.shape[-1] != 4:
-        raise ValueError(f"neighbor_agents_current_4_dim shape는 (N,4) 이어야 합니다. got {cur4.shape}")
+        raise ValueError(
+            f"neighbor_agents_current_4_dim shape는 (N,4) 이어야 합니다. got {cur4.shape}"
+        )
     if fut3.ndim != 3 or fut3.shape[-1] != 3:
-        raise ValueError(f"neighbor_future_gt_3_dim shape는 (N,Tf,3) 이어야 합니다. got {fut3.shape}")
+        raise ValueError(
+            f"neighbor_future_gt_3_dim shape는 (N,Tf,3) 이어야 합니다. got {fut3.shape}"
+        )
     if cur4.shape[0] != fut3.shape[0]:
-        raise ValueError(f"N 차원이 일치해야 합니다. got {cur4.shape[0]} vs {fut3.shape[0]}")
+        raise ValueError(
+            f"N 차원이 일치해야 합니다. got {cur4.shape[0]} vs {fut3.shape[0]}")
 
     N = int(cur4.shape[0])
     Tf = int(fut3.shape[1])
@@ -1109,7 +1164,8 @@ def _get_neighbor_cur_future_gt_3_dim(
     if not np.any(valid_mask):
         return out
 
-    heading0 = np.arctan2(cur4[:, 3], cur4[:, 2]).astype(np.float32, copy=False)  # (N,)
+    heading0 = np.arctan2(cur4[:, 3], cur4[:, 2]).astype(np.float32,
+                                                         copy=False)  # (N,)
     out[:, 0, 0] = cur4[:, 0]
     out[:, 0, 1] = cur4[:, 1]
     out[:, 0, 2] = heading0
@@ -1144,25 +1200,27 @@ def _get_near_future_segment_valid(
     nbr11 = np.asarray(neighbor_cur_future_gt_11_dim)
 
     if ego11.ndim != 2 or ego11.shape[-1] != 11:
-        raise ValueError(f"ego_cur_future_gt_11_dim shape는 (1+Tf,11) 이어야 합니다. got {ego11.shape}")
+        raise ValueError(
+            f"ego_cur_future_gt_11_dim shape는 (1+Tf,11) 이어야 합니다. got {ego11.shape}"
+        )
     if nbr11.ndim != 3 or nbr11.shape[-1] != 11:
-        raise ValueError(f"neighbor_cur_future_gt_11_dim shape는 (N,1+Tf,11) 이어야 합니다. got {nbr11.shape}")
+        raise ValueError(
+            f"neighbor_cur_future_gt_11_dim shape는 (N,1+Tf,11) 이어야 합니다. got {nbr11.shape}"
+        )
     if nbr11.shape[1] != ego11.shape[0]:
         raise ValueError(
             "시간축(1+Tf)이 일치해야 합니다. "
-            f"got ego time={ego11.shape[0]}, neighbor time={nbr11.shape[1]}"
-        )
+            f"got ego time={ego11.shape[0]}, neighbor time={nbr11.shape[1]}")
 
     ego_valid = (np.abs(ego11[:, :8]) > eps).any(axis=1)  # (1+Tf,)
     nbr_valid = (np.abs(nbr11[:, :, :8]) > eps).any(axis=2)  # (N,1+Tf)
 
-    near_cur_future_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N,1+Tf)
-    near_future_segment_valid = (near_cur_future_valid[:, :-1] & near_cur_future_valid[:, 1:]).astype(bool)  # (1+N,Tf)
+    near_cur_future_valid = np.concatenate([ego_valid[None, :], nbr_valid],
+                                           axis=0).astype(bool)  # (1+N,1+Tf)
+    near_future_segment_valid = (near_cur_future_valid[:, :-1]
+                                 & near_cur_future_valid[:, 1:]).astype(
+                                     bool)  # (1+N,Tf)
     return near_cur_future_valid, near_future_segment_valid
-
-
-
-
 
 
 def _load_training_file_list(json_path: str) -> List[str]:
@@ -1191,7 +1249,8 @@ def _read_npz_as_dict(npz_path: str) -> Dict[str, np.ndarray]:
         raise
 
 
-def _atomic_save_npz(npz_path: str, data: Dict[str, np.ndarray], *, compress: bool) -> None:
+def _atomic_save_npz(npz_path: str, data: Dict[str, np.ndarray], *,
+                     compress: bool) -> None:
     """npz를 임시 파일(.tmp)에 쓴 뒤 원래 이름으로 교체합니다."""
     tmp_path = npz_path + ".tmp"
     try:
@@ -1242,7 +1301,8 @@ def _build_future_gt_4_dim_from_3_dim(
     valid = np.asarray(future_gt_is_valid).astype(bool)
 
     if gt3.ndim < 1 or int(gt3.shape[-1]) != 3:
-        raise ValueError(f"future_gt_3_dim last dim must be 3. got shape={gt3.shape}")
+        raise ValueError(
+            f"future_gt_3_dim last dim must be 3. got shape={gt3.shape}")
 
     heading = gt3[..., 2:3]  # (..., 1)
     cos_heading = np.cos(heading)  # (..., 1)
@@ -1272,7 +1332,8 @@ def _add_future_gt_4_dim_keys_inplace(sample: Dict[str, Any]) -> None:
     ego_future_gt_3_dim = sample.get("ego_future_gt_3_dim", None)
     ego_future_gt_is_valid = sample.get("ego_future_gt_is_valid", None)
 
-    if isinstance(ego_future_gt_3_dim, np.ndarray) and isinstance(ego_future_gt_is_valid, np.ndarray):
+    if isinstance(ego_future_gt_3_dim, np.ndarray) and isinstance(
+            ego_future_gt_is_valid, np.ndarray):
         sample["ego_future_gt_4_dim"] = _build_future_gt_4_dim_from_3_dim(
             ego_future_gt_3_dim,
             ego_future_gt_is_valid,
@@ -1281,7 +1342,8 @@ def _add_future_gt_4_dim_keys_inplace(sample: Dict[str, Any]) -> None:
     near_future_gt_3_dim = sample.get("near_future_gt_3_dim", None)
     near_future_gt_is_valid = sample.get("near_future_gt_is_valid", None)
 
-    if isinstance(near_future_gt_3_dim, np.ndarray) and isinstance(near_future_gt_is_valid, np.ndarray):
+    if isinstance(near_future_gt_3_dim, np.ndarray) and isinstance(
+            near_future_gt_is_valid, np.ndarray):
         sample["near_future_gt_4_dim"] = _build_future_gt_4_dim_from_3_dim(
             near_future_gt_3_dim,
             near_future_gt_is_valid,
@@ -1335,7 +1397,8 @@ def _get_dataset_npz_keys(
             "target_z",
         ]
 
-    npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
+    npz_keys: List[
+        str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
 
     npz_key_to_new_key: Dict[str, str] = {
         "driveway": "driveway_points",
@@ -1407,21 +1470,19 @@ def _build_sample_dict_like_dataset_getitem(
     except Exception as e:
         raise RuntimeError(
             "diffusion_planner.utils.validity.add_validity_keys_inplace import 실패. "
-            "프로젝트 루트가 PYTHONPATH에 잡혀있는지 확인해 주세요."
-        ) from e
+            "프로젝트 루트가 PYTHONPATH에 잡혀있는지 확인해 주세요.") from e
 
     try:
         from nuplan_extent.planning.training.preprocessing.utils.near_agents import (
-            add_near_agents_info_inplace,
-        )
+            add_near_agents_info_inplace, )
     except Exception as e:
         raise RuntimeError(
             "nuplan_extent...add_near_agents_info_inplace import 실패. "
-            "프로젝트/의존성이 정상 설치되어 있는지 확인해 주세요."
-        ) from e
+            "프로젝트/의존성이 정상 설치되어 있는지 확인해 주세요.") from e
 
     add_validity_keys_inplace(sample, missing_policy="none")
-    add_near_agents_info_inplace(sample, predicted_neighbor_num=int(predicted_neighbor_num))
+    add_near_agents_info_inplace(
+        sample, predicted_neighbor_num=int(predicted_neighbor_num))
 
     scenario_id = str(os.path.splitext(str(file_name))[0])
     sample["scenario_id"] = scenario_id
@@ -1549,7 +1610,8 @@ def _process_one_file(
     existing_use_body_vel: Optional[bool] = None
     if CONTROL_FRAME_KEY in keys:
         try:
-            meta = _load_npz_subset_as_dict(npz_path, [CONTROL_FRAME_KEY]).get(CONTROL_FRAME_KEY, None)
+            meta = _load_npz_subset_as_dict(npz_path, [CONTROL_FRAME_KEY]).get(
+                CONTROL_FRAME_KEY, None)
             if meta is not None:
                 existing_use_body_vel = _to_bool_scalar(meta)
         except Exception:
@@ -1557,7 +1619,9 @@ def _process_one_file(
     elif (PAST_CONTROL_KEY in keys) or (FUTURE_CONTROL_KEY in keys):
         existing_use_body_vel = True  # 예전 결과는 body 기준이었다고 가정
 
-    mode_mismatch = (existing_use_body_vel is not None) and (bool(existing_use_body_vel) != bool(use_body_vel))
+    mode_mismatch = (existing_use_body_vel
+                     is not None) and (bool(existing_use_body_vel)
+                                       != bool(use_body_vel))
 
     expected = _build_expected_keys_for_done(
         keys,
@@ -1567,23 +1631,29 @@ def _process_one_file(
     missing_expected = expected.difference(keys)
 
     # control 필요 여부(각각) + (ADD) mode mismatch면 강제 재계산
-    need_past_control = bool(overwrite) or bool(mode_mismatch) or (PAST_CONTROL_KEY in missing_expected)
-    need_future_control = bool(overwrite) or bool(mode_mismatch) or (FUTURE_CONTROL_KEY in missing_expected)
-    need_control_frame = bool(overwrite) or bool(mode_mismatch) or (CONTROL_FRAME_KEY in missing_expected)
+    need_past_control = bool(overwrite) or bool(mode_mismatch) or (
+        PAST_CONTROL_KEY in missing_expected)
+    need_future_control = bool(overwrite) or bool(mode_mismatch) or (
+        FUTURE_CONTROL_KEY in missing_expected)
+    need_control_frame = bool(overwrite) or bool(mode_mismatch) or (
+        CONTROL_FRAME_KEY in missing_expected)
 
-    need_control = bool(need_past_control or need_future_control or need_control_frame)
+    need_control = bool(need_past_control or need_future_control
+                        or need_control_frame)
 
     control_key_set = set(_CONTROL_KEYS)
 
     need_sample = bool(add_sample_keys) and (
-        bool(overwrite_sample_keys) or (len(missing_expected.difference(control_key_set)) > 0)
-    )
+        bool(overwrite_sample_keys) or
+        (len(missing_expected.difference(control_key_set)) > 0))
 
     if (not need_control) and (not need_sample):
         return True, "skip(no change)"
 
     # overwrite 계열이면: 중복 entry 방지 위해 전체 재저장
-    must_full_rewrite = bool(overwrite) or (bool(add_sample_keys) and bool(overwrite_sample_keys)) or bool(mode_mismatch)
+    must_full_rewrite = bool(overwrite) or (
+        bool(add_sample_keys)
+        and bool(overwrite_sample_keys)) or bool(mode_mismatch)
 
     # ------------------------------------------------------------
     # (A) 기본 모드(덮어쓰기 없음): 필요한 입력만 로드 + 새 key만 append 저장
@@ -1594,38 +1664,37 @@ def _process_one_file(
         if bool(need_past_control) or bool(need_future_control):
             keys_to_load.update({"ego_agent_past", "neighbor_agents_past"})
             if bool(need_future_control):
-                keys_to_load.update({"ego_future_gt_11_dim", "neighbor_future_gt_11_dim"})
+                keys_to_load.update(
+                    {"ego_future_gt_11_dim", "neighbor_future_gt_11_dim"})
 
         if bool(need_sample):
-            keys_to_load.update(
-                {
-                    "origin_world_pose",
-                    "ego_agent_past",
-                    "ego_future_gt_3_dim",
-                    "ego_future_gt_11_dim",
-                    "neighbor_agents_past",
-                    "neighbor_future_gt_3_dim",
-                    "neighbor_future_gt_11_dim",
-                    "stop_sign_points",
-                    "crosswalk_points",
-                    "lanes",
-                    "lanes_speed_limit",
-                    "lanes_has_speed_limit",
-                    "static_objects",
-                    "route_lanes",
-                    "route_lanes_speed_limit",
-                    "route_lanes_has_speed_limit",
-                    "speed_bump_points",
-                    "driveway_points",
-                    "lane_type",
-                    "left_line_type",
-                    "right_line_type",
-                    "road_edge",
-                    "road_edge_type",
-                    "target_id",
-                    "target_z",
-                }
-            )
+            keys_to_load.update({
+                "origin_world_pose",
+                "ego_agent_past",
+                "ego_future_gt_3_dim",
+                "ego_future_gt_11_dim",
+                "neighbor_agents_past",
+                "neighbor_future_gt_3_dim",
+                "neighbor_future_gt_11_dim",
+                "stop_sign_points",
+                "crosswalk_points",
+                "lanes",
+                "lanes_speed_limit",
+                "lanes_has_speed_limit",
+                "static_objects",
+                "route_lanes",
+                "route_lanes_speed_limit",
+                "route_lanes_has_speed_limit",
+                "speed_bump_points",
+                "driveway_points",
+                "lane_type",
+                "left_line_type",
+                "right_line_type",
+                "road_edge",
+                "road_edge_type",
+                "target_id",
+                "target_z",
+            })
             if bool(use_agent_route_lane_order):
                 keys_to_load.add("agent_route_lane_order")
 
@@ -1655,7 +1724,8 @@ def _process_one_file(
                     ego_agent_past=npz_data["ego_agent_past"],
                     ego_future_gt_11_dim=npz_data["ego_future_gt_11_dim"],
                     neighbor_agents_past=npz_data["neighbor_agents_past"],
-                    neighbor_future_gt_11_dim=npz_data["neighbor_future_gt_11_dim"],
+                    neighbor_future_gt_11_dim=npz_data[
+                        "neighbor_future_gt_11_dim"],
                     dt=float(dt),
                     use_body_vel=bool(use_body_vel),
                 )
@@ -1663,7 +1733,8 @@ def _process_one_file(
 
         # (A-1.5) (ADD) control frame 메타키
         if bool(need_control_frame):
-            new_arrays[CONTROL_FRAME_KEY] = np.asarray(bool(use_body_vel), dtype=np.bool_)
+            new_arrays[CONTROL_FRAME_KEY] = np.asarray(bool(use_body_vel),
+                                                       dtype=np.bool_)
 
         # (A-2) sample 파생키
         if bool(need_sample):
@@ -1673,7 +1744,8 @@ def _process_one_file(
                     file_name=os.path.basename(npz_path),
                     predicted_neighbor_num=int(predicted_neighbor_num),
                     eval_method=str(eval_method),
-                    use_agent_route_lane_order=bool(use_agent_route_lane_order),
+                    use_agent_route_lane_order=bool(
+                        use_agent_route_lane_order),
                 )
             except Exception as e:
                 return False, f"build_sample_failed: {type(e).__name__}: {e}"
@@ -1704,41 +1776,45 @@ def _process_one_file(
     data = _read_npz_as_dict(npz_path)
     changed = False
 
-    need_control_full = (
-        bool(overwrite)
-        or bool(mode_mismatch)
-        or (PAST_CONTROL_KEY not in data)
-        or (FUTURE_CONTROL_KEY not in data)
-        or (CONTROL_FRAME_KEY not in data)
-    )
+    need_control_full = (bool(overwrite) or bool(mode_mismatch)
+                         or (PAST_CONTROL_KEY not in data)
+                         or (FUTURE_CONTROL_KEY not in data)
+                         or (CONTROL_FRAME_KEY not in data))
 
     if bool(need_control_full):
-        for k in ["ego_agent_past", "neighbor_agents_past", "ego_future_gt_11_dim", "neighbor_future_gt_11_dim"]:
+        for k in [
+                "ego_agent_past", "neighbor_agents_past",
+                "ego_future_gt_11_dim", "neighbor_future_gt_11_dim"
+        ]:
             if k not in data:
                 return False, f"missing key '{k}'"
 
-        data[PAST_CONTROL_KEY] = build_past_seg_control_gt_3_dim_from_npz_arrays(
-            ego_agent_past=data["ego_agent_past"],
-            neighbor_agents_past=data["neighbor_agents_past"],
-            dt=float(dt),
-            use_body_vel=bool(use_body_vel),
-        )
-        data[FUTURE_CONTROL_KEY] = build_future_seg_control_gt_3_dim_from_npz_arrays(
-            ego_agent_past=data["ego_agent_past"],
-            ego_future_gt_11_dim=data["ego_future_gt_11_dim"],
-            neighbor_agents_past=data["neighbor_agents_past"],
-            neighbor_future_gt_11_dim=data["neighbor_future_gt_11_dim"],
-            dt=float(dt),
-            use_body_vel=bool(use_body_vel),
-        )
+        data[
+            PAST_CONTROL_KEY] = build_past_seg_control_gt_3_dim_from_npz_arrays(
+                ego_agent_past=data["ego_agent_past"],
+                neighbor_agents_past=data["neighbor_agents_past"],
+                dt=float(dt),
+                use_body_vel=bool(use_body_vel),
+            )
+        data[
+            FUTURE_CONTROL_KEY] = build_future_seg_control_gt_3_dim_from_npz_arrays(
+                ego_agent_past=data["ego_agent_past"],
+                ego_future_gt_11_dim=data["ego_future_gt_11_dim"],
+                neighbor_agents_past=data["neighbor_agents_past"],
+                neighbor_future_gt_11_dim=data["neighbor_future_gt_11_dim"],
+                dt=float(dt),
+                use_body_vel=bool(use_body_vel),
+            )
 
         old_meta = data.get(CONTROL_FRAME_KEY, None)
-        data[CONTROL_FRAME_KEY] = np.asarray(bool(use_body_vel), dtype=np.bool_)
+        data[CONTROL_FRAME_KEY] = np.asarray(bool(use_body_vel),
+                                             dtype=np.bool_)
         if old_meta is None:
             changed = True
         else:
             try:
-                changed = True if (_to_bool_scalar(old_meta) != bool(use_body_vel)) else True
+                changed = True if (_to_bool_scalar(old_meta)
+                                   != bool(use_body_vel)) else True
             except Exception:
                 changed = True
 
@@ -1769,7 +1845,6 @@ def _process_one_file(
 
     _atomic_save_npz(npz_path, data, compress=bool(compress))
     return True, "ok"
-
 
 
 # --------------------
@@ -1826,10 +1901,8 @@ def _calculate_control_statistics_from_npz_path(
     return True, "ok", acc
 
 
-
 def _worker_calculate_statistics_one_fname(
-    fname: str,
-) -> Tuple[str, bool, str, int, List[float], List[float]]:
+    fname: str, ) -> Tuple[str, bool, str, int, List[float], List[float]]:
     """멀티프로세스 워커: 파일 1개 통계를 계산해 (count,sum,sumsq)만 반환합니다."""
     cfg = _WORKER_CONFIG
     dataset_dir = str(cfg["dataset_dir"])
@@ -1838,8 +1911,8 @@ def _worker_calculate_statistics_one_fname(
     npz_path = os.path.join(dataset_dir, str(fname))
 
     use_body_vel = bool(cfg["use_body_vel"])
-    ok, msg, acc = _calculate_control_statistics_from_npz_path(npz_path, dt=dt,
-                                                               use_body_vel=use_body_vel)
+    ok, msg, acc = _calculate_control_statistics_from_npz_path(
+        npz_path, dt=dt, use_body_vel=use_body_vel)
     if not ok:
         return str(fname), False, str(msg), 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
 
@@ -1848,8 +1921,8 @@ def _worker_calculate_statistics_one_fname(
         True,
         "ok",
         int(acc.count),
-        [float(x) for x in acc.sum.reshape((3,)).tolist()],
-        [float(x) for x in acc.sumsq.reshape((3,)).tolist()],
+        [float(x) for x in acc.sum.reshape((3, )).tolist()],
+        [float(x) for x in acc.sumsq.reshape((3, )).tolist()],
     )
 
 
@@ -1860,7 +1933,7 @@ def _run_only_calculate_statistics(
     dt: float,
     limit: int,
     workers_arg: int,
-use_body_vel: bool,
+    use_body_vel: bool,
 ) -> None:
     """npz를 수정하지 않고 mean/std만 계산하는 실행 함수입니다.
 
@@ -1876,14 +1949,15 @@ use_body_vel: bool,
     """
     file_names = _load_training_file_list(train_json)
     if int(limit) > 0:
-        file_names = file_names[: int(limit)]
+        file_names = file_names[:int(limit)]
 
     total_files = len(file_names)
     if total_files <= 0:
         print("done. files_total=0, files_failed=0, samples_valid=0")
         return
 
-    workers: int = int(workers_arg) if int(workers_arg) > 0 else _get_auto_worker_count(total_files)
+    workers: int = int(workers_arg) if int(
+        workers_arg) > 0 else _get_auto_worker_count(total_files)
     workers = max(1, min(int(workers), int(total_files)))
 
     global_acc = ControlStatsAccumulator()
@@ -1897,9 +1971,8 @@ use_body_vel: bool,
         pbar = tqdm(file_names, desc="only_calculate_statistics")
         for idx, fname in enumerate(pbar, start=1):
             npz_path = os.path.join(dataset_dir, str(fname))
-            ok, msg, acc = _calculate_control_statistics_from_npz_path(npz_path, dt=float(dt),
-                                                                       use_body_vel=bool(use_body_vel)
-                                                                       )
+            ok, msg, acc = _calculate_control_statistics_from_npz_path(
+                npz_path, dt=float(dt), use_body_vel=bool(use_body_vel))
             if ok:
                 global_acc.merge(acc)
             else:
@@ -1935,20 +2008,21 @@ use_body_vel: bool,
     ctx = mp.get_context()
     processed_count = 0
 
-    pbar = tqdm(total=total_files, desc=f"only_calculate_statistics (workers={workers})")
+    pbar = tqdm(total=total_files,
+                desc=f"only_calculate_statistics (workers={workers})")
 
     pool = ctx.Pool(
         processes=workers,
         initializer=_init_worker_process,
-        initargs=(worker_config,),
+        initargs=(worker_config, ),
     )
 
     try:
         chunksize = 4
         for fname, ok, msg, count, sum_list, sumsq_list in pool.imap_unordered(
-            _worker_calculate_statistics_one_fname,
-            file_names,
-            chunksize=chunksize,
+                _worker_calculate_statistics_one_fname,
+                file_names,
+                chunksize=chunksize,
         ):
             processed_count += 1
             pbar.update(1)
@@ -2014,9 +2088,18 @@ def _print_control_statistics_summary(
 
     # 복사/붙여넣기 편하게 json도 같이 출력
     out = {
-        "v_x_b": {"mean": float(mean[0]), "std": float(std[0])},
-        "v_y_b": {"mean": float(mean[1]), "std": float(std[1])},
-        "yaw_rate": {"mean": float(mean[2]), "std": float(std[2])},
+        "v_x_b": {
+            "mean": float(mean[0]),
+            "std": float(std[0])
+        },
+        "v_y_b": {
+            "mean": float(mean[1]),
+            "std": float(std[1])
+        },
+        "yaw_rate": {
+            "mean": float(mean[2]),
+            "std": float(std[2])
+        },
         "samples_valid": int(acc.count),
         "files_total": int(total_files),
         "files_failed": int(fail_count),
@@ -2026,7 +2109,8 @@ def _print_control_statistics_summary(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Add future_seg_control_gt_3_dim and (optionally) dataset sample keys to existing npz files."
+        description=
+        "Add future_seg_control_gt_3_dim and (optionally) dataset sample keys to existing npz files."
     )
     parser.add_argument(
         "--dataset_dir",
@@ -2037,22 +2121,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train_json",
         type=str,
-        default="/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json",
+        default=
+        "/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json",
         help="학습에 쓰는 npz 파일명 리스트(json)",
     )
     parser.add_argument(
         "--use_body_vel",
         type=_str2bool,
         default=False,
-        help=(
-            "True면 (v_x^b, v_y^b, yaw_rate)처럼 heading 기준으로 회전한 몸체 좌표계 속도를 저장합니다. "
-            "False면 (x,y)가 표현된 좌표계에서 (v_x, v_y, yaw_rate) = (dx/dt, dy/dt, d(yaw)/dt)로 저장합니다."
-        ),
+        help=
+        ("True면 (v_x^b, v_y^b, yaw_rate)처럼 heading 기준으로 회전한 몸체 좌표계 속도를 저장합니다. "
+         "False면 (x,y)가 표현된 좌표계에서 (v_x, v_y, yaw_rate) = (dx/dt, dy/dt, d(yaw)/dt)로 저장합니다."
+         ),
     )
-    parser.add_argument("--dt", type=float, default=0.1, help="시간 간격 dt (예: 0.1)")
-    parser.add_argument("--overwrite", action="store_true", help="이미 control 키가 있어도 다시 계산해서 덮어씁니다.")
-    parser.add_argument("--no_compress", action="store_true", help="저장할 때 압축을 끕니다(더 빠르지만 파일이 커짐).")
-    parser.add_argument("--limit", type=int, default=0, help="0이면 전체, 양수면 앞에서 N개만 처리")
+    parser.add_argument("--dt",
+                        type=float,
+                        default=0.1,
+                        help="시간 간격 dt (예: 0.1)")
+    parser.add_argument("--overwrite",
+                        action="store_true",
+                        help="이미 control 키가 있어도 다시 계산해서 덮어씁니다.")
+    parser.add_argument("--no_compress",
+                        action="store_true",
+                        help="저장할 때 압축을 끕니다(더 빠르지만 파일이 커짐).")
+    parser.add_argument("--limit",
+                        type=int,
+                        default=0,
+                        help="0이면 전체, 양수면 앞에서 N개만 처리")
     parser.add_argument(
         "--only_calculate_statistics",
         action="store_true",
@@ -2063,7 +2158,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip_sample_keys",
         action="store_true",
-        help="dataset.py __getitem__에서 만들던 sample 파생키(validity/near/gt_4_dim/scenario_id)를 npz에 저장하지 않습니다.",
+        help=
+        "dataset.py __getitem__에서 만들던 sample 파생키(validity/near/gt_4_dim/scenario_id)를 npz에 저장하지 않습니다.",
     )
     parser.add_argument(
         "--overwrite_sample_keys",
@@ -2081,7 +2177,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="train",
         choices=["train", "validation", "test"],
-        help="dataset.py __getitem__에서 일부 key 선택에 쓰는 모드. tfrecord_path는 어떤 모드에서도 추가하지 않습니다.",
+        help=
+        "dataset.py __getitem__에서 일부 key 선택에 쓰는 모드. tfrecord_path는 어떤 모드에서도 추가하지 않습니다.",
     )
     parser.add_argument(
         "--use_agent_route_lane_order",
@@ -2096,6 +2193,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="프로세스 개수. 0이면 자동(최대 16), 1이면 순차 처리",
     )
     return parser
+
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
@@ -2113,7 +2211,8 @@ def main() -> None:
     eval_method: str = str(args.eval_method)
     use_agent_route_lane_order: bool = bool(args.use_agent_route_lane_order)
 
-    only_calculate_statistics: bool = bool(getattr(args, "only_calculate_statistics", False))
+    only_calculate_statistics: bool = bool(
+        getattr(args, "only_calculate_statistics", False))
     workers_arg: int = int(getattr(args, "workers", 0))
 
     if only_calculate_statistics:
@@ -2136,7 +2235,8 @@ def main() -> None:
         print("done. ok=0, fail=0, skip=0, total=0")
         return
 
-    workers: int = workers_arg if workers_arg > 0 else _get_auto_worker_count(total_files)
+    workers: int = workers_arg if workers_arg > 0 else _get_auto_worker_count(
+        total_files)
     workers = max(1, min(int(workers), int(total_files)))
 
     ok_count = 0
@@ -2162,13 +2262,13 @@ def main() -> None:
                     keys = None
 
                 if _is_already_processed_npz(
-                    npz_path,
-                    overwrite=overwrite,
-                    add_sample_keys=add_sample_keys,
-                    overwrite_sample_keys=overwrite_sample_keys,
-                    use_agent_route_lane_order=use_agent_route_lane_order,
-                    existing_keys=keys,
-                    use_body_vel=use_body_vel,
+                        npz_path,
+                        overwrite=overwrite,
+                        add_sample_keys=add_sample_keys,
+                        overwrite_sample_keys=overwrite_sample_keys,
+                        use_agent_route_lane_order=use_agent_route_lane_order,
+                        existing_keys=keys,
+                        use_body_vel=use_body_vel,
                 ):
                     ok = True
                     msg = "skip(already processed)"
@@ -2206,7 +2306,9 @@ def main() -> None:
                 interval_s=300.0,
             )
 
-        print(f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={total_files}")
+        print(
+            f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={total_files}"
+        )
         return
 
     # -----------------------------
@@ -2228,19 +2330,21 @@ def main() -> None:
     ctx = mp.get_context()  # 기본 시작 방식 사용
     processed_count = 0
 
-    pbar = tqdm(total=total_files, desc=f"add_control_to_npz (workers={workers})")
+    pbar = tqdm(total=total_files,
+                desc=f"add_control_to_npz (workers={workers})")
 
     pool = ctx.Pool(
         processes=workers,
         initializer=_init_worker_process,
-        initargs=(worker_config,),
+        initargs=(worker_config, ),
     )
 
     try:
         # chunksize는 너무 작으면 오버헤드가 커질 수 있어 적당히 잡습니다.
         chunksize = 4
 
-        for fname, ok, msg, skipped in pool.imap_unordered(_worker_process_one_fname, file_names, chunksize=chunksize):
+        for fname, ok, msg, skipped in pool.imap_unordered(
+                _worker_process_one_fname, file_names, chunksize=chunksize):
             processed_count += 1
             pbar.update(1)
 
@@ -2271,14 +2375,13 @@ def main() -> None:
     finally:
         pbar.close()
 
-    print(f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={total_files}")
-
-
+    print(
+        f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={total_files}"
+    )
 
 
 if __name__ == "__main__":
     main()
-
 """
 python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py
 
