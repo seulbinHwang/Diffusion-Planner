@@ -9,15 +9,15 @@
     },
     "seg_body_control": {
         "mean": [0, 0, 0],
-        "std": [2.5, 2.5, 1]
+        "std": [3.5, 0.3, 1]
     },
     "past_seg_control_gt_3_dim": {
         "mean": [0, 0, 0],
-        "std": [2.5, 2.5, 1]
+        "std": [3.5, 0.3, 1]
     },
     "future_seg_control_gt_3_dim": {
         "mean": [0, 0, 0],
-        "std": [2.5, 2.5, 1]
+        "std": [3.5, 0.3, 1]
     },
     "ego_agent_past": {
         "mean": [10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
