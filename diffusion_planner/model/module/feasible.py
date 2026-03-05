@@ -5695,8 +5695,8 @@ class FeasibleProjector(nn.Module):
                                       args.w_int_min) * (p / args.p_sat)
         else:
             w_int = args.w_int_max
-        if p < args.p_const_sat:
-            w_const = 0. + (args.w_const) * (p / args.p_const_sat)
+        if p < args.p_sat:
+            w_const = 0. + (args.w_const) * (p / args.p_sat)
         else:
             w_const = args.w_const
         return args.w_dir, w_int, w_const

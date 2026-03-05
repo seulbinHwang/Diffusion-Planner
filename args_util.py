@@ -236,7 +236,6 @@ def get_args():
                         help='number of route lane point',
                         default=10)
     parser.add_argument('--p_sat', type=float, help='p_sat', default=0.6)
-    parser.add_argument('--p_const_sat', type=float, help='p_sat', default=1.)
     parser.add_argument('--w_dir', type=float, help='w_dir', default=1.0)
     parser.add_argument('--w_int_min',
                         type=float,
