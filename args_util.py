@@ -336,8 +336,8 @@ def get_args():
                         type=float,
                         default=150.,
                         help='filter_radius meter')
-    parser.add_argument('--lane_prune_topk', type=int, default=200)
-    parser.add_argument('--road_safety_prune_topk', type=int, default=35)
+    parser.add_argument('--lane_prune_topk', type=int, default=225)
+    parser.add_argument('--road_safety_prune_topk', type=int, default=40)
     parser.add_argument('--road_edge_prune_topk', type=int, default=50)
     parser.add_argument(
         '--pruning_use_batch_max_k',

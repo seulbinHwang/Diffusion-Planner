@@ -26,8 +26,8 @@ def _pick_normalization_file_path(args_dict: dict[str, Any]) -> str:
         str: 선택된 normalization json 경로 문자열.
 
     Notes:
-        - use_body_vel == True  -> "normalization_use_body_vel_new.json"
-        - use_body_vel == False -> "normalization_new.json"
+        - use_body_vel == True  -> "normalization_use_body_vel.json"
+        - use_body_vel == False -> "normalization.json"
         - normalization_file_path 가 위 두 기본 파일명 중 하나를 가리키면(use_body_vel 규칙을 적용).
         - normalization_file_path가 "다른 파일"이면 그 값을 그대로 사용합니다.
     """
@@ -49,7 +49,7 @@ def _pick_normalization_file_path(args_dict: dict[str, Any]) -> str:
     else:
         use_body_vel = bool(raw_flag)
 
-    desired = "normalization_use_body_vel_new.json" if use_body_vel else "normalization_new.json"
+    desired = "normalization_use_body_vel.json" if use_body_vel else "normalization.json"
 
     given = args_dict.get("normalization_file_path", None)
     if given is None:
@@ -65,7 +65,7 @@ def _pick_normalization_file_path(args_dict: dict[str, Any]) -> str:
     except Exception:
         given_name = given_str
 
-    if given_name in ("normalization_new.json", "normalization_use_body_vel_new.json"):
+    if given_name in ("normalization.json", "normalization_use_body_vel.json"):
         return desired
 
     # 그 외엔 사용자가 지정한 경로를 존중
