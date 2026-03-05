@@ -1,112 +1,131 @@
-from typing import List
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
 import torch
 
-from diffusion_planner.model.diffusion_utils.sde import VPSDE_linear
-from diffusion_planner.model.guidance.collision import collision_guidance_fn
-from diffusion_planner.model.guidance.feasible_gui import feasible_guidance_fn
-
-N = 1
-sde = VPSDE_linear()
+from diffusion_planner.model.guidance.safety_guidance import safety_guidance_fn
 
 
 class GuidanceWrapper:
+    """여러 guidance 함수를 한 번에 호출하기 위한 래퍼입니다.
 
-    def __init__(self):
-        self._guidance_fns = [feasible_guidance_fn
-                             ]  # collision_guidance_fn 안쓸거임
+    핵심 규칙(중요)
+    - DPM-Solver classifier 경로에서는 첫 입력 x_in이 "현재 샘플(x_t)"입니다.
+      그래서 안전 점수는 반드시 모델이 만든 "복원 결과(x0_pred)"로 계산해야 합니다.
+    - model_wrapper가 kwargs["x0_pred"]를 넘겨주면 그걸 그대로 씁니다.
+    - amortized 1-step처럼 x0_pred가 없으면, 여기서 모델을 다시 호출해 x0_pred를 만들고 씁니다.
+    """
 
-    def __call__(self, x_in, t_input, cond, *args, **kwargs):
+    def __init__(self) -> None:
+        # ✅ feasible_guidance_fn 제거, safety_guidance만 사용
+        self._guidance_fns: List[Any] = [safety_guidance_fn]
+
+    def _get_x0_pred_flat(
+        self,
+        x_in: torch.Tensor,  # (B,P,F)
+        t_input: torch.Tensor,  # (B,) 또는 (B,T)도 가능(Decoder가 넘기면)
+        *,
+        kwargs: Dict[str, Any],
+    ) -> torch.Tensor:
+        """guidance 계산에 사용할 x0_pred(flat)를 확보합니다.
+
+        우선순위:
+        1) kwargs["x0_pred"] 가 있으면 그대로 사용
+        2) 없으면 model(x_in, diffusion_time, ...)을 다시 호출해서 model.diffusion_sequence_flat을 사용
+
+        Args:
+            x_in (torch.Tensor): 현재 샘플(flat). shape: (B,P,F)
+            t_input (torch.Tensor): 대표 시간. shape: (B,)
+            kwargs (Dict[str,Any]): model/model_condition/config 등이 들어 있음
+
+        Returns:
+            torch.Tensor: x0_pred(flat), shape: (B,P,F)
         """
-        TODO
-2) GuidanceWrapper는 무조건 (...,4)로 reshape 함 → pose_based=False면 바로 터짐
+        x0_pred = kwargs.get("x0_pred", None)
+        if isinstance(x0_pred, torch.Tensor):
+            return x0_pred
 
-GuidanceWrapper에서 x_fix = x_fix.reshape(B,P,-1,4) / x_dit = x_dit.reshape(B,P,-1,4)를 고정으로 함.
+        model = kwargs.get("model", None)
+        model_condition = kwargs.get("model_condition", None)
+        if model is None or not isinstance(model_condition, dict):
+            raise ValueError(
+                "GuidanceWrapper: x0_pred가 없는데 model/model_condition을 찾을 수 없습니다."
+            )
 
-그러면 pose_based=False(3차원 control)에서는 shape이 3의 배수라서 바로 에러 날 거야.
+        # ✅ amortized 1-step에서는 Decoder가 (B,T)인 t_tau를 넘겨줄 수 있음
+        diffusion_time_for_guidance = kwargs.get("diffusion_time_for_guidance", None)
+        if isinstance(diffusion_time_for_guidance, torch.Tensor):
+            diffusion_time = diffusion_time_for_guidance
+        else:
+            diffusion_time = t_input
 
-3) model_type="v"일 때 GuidanceWrapper의 “의미”가 어긋날 수 있음
+        diffusion_time = diffusion_time.to(device=x_in.device, dtype=torch.float32)
 
-GuidanceWrapper는 x_dit를 사실상 model(x_in, t) 출력으로 만들고(= x_in + (model(x_in,t)-x_in)),
+        # (B,T) 시간을 쓰면, DiT 내부 feasible 쪽에서 (B,) low_t_mask가 필요할 수 있어 안전하게 제공
+        low_t_mask = kwargs.get("low_t_mask_for_guidance", None)
+        if low_t_mask is None and diffusion_time.dim() == 2:
+            B = int(x_in.shape[0])
+            low_t_mask = torch.ones((B,), device=x_in.device, dtype=torch.bool)
 
-그걸 “정규화된 pose 궤적”처럼 reshape해서 feasible_guidance_fn(x_dit, ...)에 넣고 있어.
+        # 모델 재호출(grad 흐름 유지)
+        _ = model(
+            x_in,
+            diffusion_time,
+            **model_condition,
+            low_t_mask=low_t_mask,
+        )
 
-그런데 네 DiT는
+        x0_new = getattr(model, "diffusion_sequence_flat", None)
+        if not isinstance(x0_new, torch.Tensor):
+            raise RuntimeError("GuidanceWrapper: model.diffusion_sequence_flat을 얻지 못했습니다.")
+        return x0_new
 
-model_type="x_start"면 model(...) 출력이 x0라서 괜찮을 수 있는데,
+    def __call__(
+        self,
+        x_in: torch.Tensor,  # (B,P,F)  (DPM-Solver에서는 x_t)
+        t_input: torch.Tensor,  # (B,)
+        cond: Optional[torch.Tensor] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """guidance 점수(스칼라)를 (B,)로 반환합니다.
 
-model_type="v"면 model(...) 출력이 v(속도 파라미터) 이고, 그걸 pose처럼 취급하면 guidance 의미가 깨질 가능성이 커.
+        Args:
+            x_in (torch.Tensor): 현재 샘플(flat). shape: (B,P,F)
+            t_input (torch.Tensor): 시간. shape: (B,)
+            cond (Optional[torch.Tensor]): 사용 안 함
+            **kwargs: model/model_condition/state_normalizer/config/inputs/x0_pred 등
 
-→ 설계안에서 너가 강조한 “x0_base를 기반으로 마지막 정리” 관점과도 어긋나.
-(v를 쓰는 경우라면, guidance가 참조할 “x_dit”를 model.diffusion_trajectory_flat(= x0) 쪽으로 잡는 게 더 일관돼.)
-
+        Returns:
+            torch.Tensor: (B,) 점수 텐서
         """
-        """
-        This function is a wrapper for the guidance functions in the model.
+        if x_in.dim() != 3:
+            raise ValueError(f"GuidanceWrapper: x_in must be (B,P,F). got {tuple(x_in.shape)}")
+        if t_input.dim() != 1:
+            raise ValueError(f"GuidanceWrapper: t_input must be (B,). got {tuple(t_input.shape)}")
 
-        kwargs
-            "model": self.dit,
-            "model_condition":
-            {
-                "cross_c":
-                    scene_encoding_token,
-                "ego_fut_global":
-                    ego_fut_global,
-                "near_agents_route_lane_emb":
-                    near_agents_route_lane_emb,
-                "near_past_cur_future_valid":
-                    near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-                "cross_mask":
-                    scene_encoding_token_mask,
-                "route_known_mask":
-                    route_known_mask,
-                "near_class_one_hot":
-                    near_class_one_hot,
-                "near_current_xyyaw":
-                    near_current_xyyaw,
-                "near_past":
-                    near_past,  # [B, pnn, past_len=(time_len - 1), 11]
-            },
-            "inputs": inputs,
-            "observation_normalizer": self._observation_normalizer,
-            "state_normalizer": self._state_normalizer
-        """
-        energy = 0
+        # ✅ 핵심: 안전 점수는 x0_pred로 계산
+        x0_pred_flat = self._get_x0_pred_flat(x_in=x_in, t_input=t_input, kwargs=kwargs)
 
-        B, P, _ = x_in.shape
-        model = kwargs["model"]
-        model_condition = kwargs["model_condition"]
-        config = kwargs["config"]
+        # safety_guidance_fn이 kwargs["x0_pred"]를 우선 사용하도록 같이 넣어둠
+        local_kwargs = dict(kwargs)
+        local_kwargs["x0_pred"] = x0_pred_flat
 
-        # x_fix : (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
-        # x_fix = model(x_in, t_input, **model_condition).detach() - x_in.detach()
-        x_fix = model(x_in, t_input, **model_condition) - x_in
+        B = int(x_in.shape[0])
+        energy = x_in.new_zeros((B,), dtype=torch.float32)
 
-        assert x_fix.requires_grad, \
-            " GuidanceWrapper 입력이 x_in에 대한 gradient를 가지지 않습니다."
-        feasible_returns = model.norm_dit_returns
-        kwargs[
-            "integrated_trajectory"] = feasible_returns.integrated_trajectory  # (B,Pnn,T,4)
-        kwargs[
-            "control_constraint_diff"] = feasible_returns.control_constraint_diff  # (B,Pnn,T,3)
-        # x_fix : (B, Pnn, T, 4) or (B, Pnn, (1+T), 4)
-        x_fix = x_fix.reshape(B, P, -1, 4)
-        if config.use_current_input:
-            x_fix[:, :, 0] = 0.0
-        # x_dit : (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
-        x_dit = x_in + x_fix.reshape(B, P, -1)
+        for fn in self._guidance_fns:
+            out = fn(
+                x0_pred_flat,  # 첫 인자도 x0로 맞춤
+                t_input,
+                cond,
+                **local_kwargs,
+            )
+            if not isinstance(out, torch.Tensor):
+                raise TypeError(f"GuidanceWrapper: guidance fn must return Tensor, got {type(out)}")
+            energy = energy + out.to(torch.float32)
 
-        # x_dit : (B, Pnn, T, 4) or (B, Pnn, (1+T), 4)
-        # x_dit = state_normalizer.inverse(x_dit.reshape(B, P, -1, 4))
-        x_dit = x_dit.reshape(B, P, -1, 4)  # 정규화된 상태 그대로 guidance_fn 에 넘김
-        assert x_dit.requires_grad, \
-            "GuidanceWrapper 출력이 x_dit에 대한 gradient를 가지지 않습니다."
-        # x_dit에 의존하는 0 텐서 (B,)
-        # TODO: 안 써서, 주석 처리함
-        # kwargs["inputs"] = observation_normalizer.inverse(kwargs["inputs"])
-
-        for guidance_fn in self._guidance_fns:
-            energy += guidance_fn(x_dit, t_input, cond, **kwargs)
-
-        assert not torch.isnan(energy).any()
-
+        if torch.isnan(energy).any():
+            raise RuntimeError("GuidanceWrapper: energy에 NaN이 있습니다.")
         return energy

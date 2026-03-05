@@ -1282,6 +1282,37 @@ class Decoder(nn.Module):
                                                          -1).contiguous()
         return t_tau
 
+    def _compute_amortized_t_eff_for_guidance(self,
+                                              t_tau: torch.Tensor) -> torch.Tensor:
+        """amortized 1-step에서 guidance에 쓸 대표 시간값을 만듭니다.
+
+        의도:
+            - safety_guidance는 보통 "가까운 미래 K스텝"만 보므로,
+              (B,T) 시간값 중 앞 K개만 평균낸 값을 대표값으로 씁니다.
+            - config.safety_K가 없으면 기본 10을 사용합니다.
+
+        Args:
+            t_tau (torch.Tensor): 프레임별 시간값.
+                shape: (B, future_len)
+
+        Returns:
+            torch.Tensor: 대표 시간값.
+                shape: (B,)
+                dtype: float32
+        """
+        if t_tau.dim() != 2:
+            raise ValueError(
+                f"t_tau must be 2D (B,future_len). got {tuple(t_tau.shape)}")
+
+        B, T = t_tau.shape
+        k_cfg = int(getattr(self.config, "safety_K", 10))
+        if k_cfg <= 0:
+            k_use = int(T)
+        else:
+            k_use = int(max(1, min(k_cfg, int(T))))
+
+        return t_tau[:, :k_use].mean(dim=1).to(torch.float32)
+
     def _compute_amortized_t_eff(self, t_tau: torch.Tensor) -> torch.Tensor:
         """(B, future_len) 형태의 시간값을 (B,) 대표 시간값으로 요약한다.
 
@@ -1398,6 +1429,64 @@ class Decoder(nn.Module):
 
         return sigma2_over_alpha.view(B, 1, 1)  # (B,1,1)
 
+    def _build_guidance_update_mask_flat(
+            self,
+            x_flat: torch.Tensor,  # (B,P,F)
+            target_past_cur_future_valid: torch.Tensor,  # (B,P,time_len+T)
+    ) -> torch.Tensor:
+        """guidance 업데이트를 허용할 위치만 1인 마스크를 만듭니다.
+
+        - 과거/현재는 0
+        - 미래(valid)만 1
+        """
+        if x_flat.dim() != 3:
+            raise ValueError(
+                f"x_flat must be (B,P,F). got {tuple(x_flat.shape)}")
+
+        B, P, F = x_flat.shape
+        pose_based = bool(getattr(self.config, "pose_based", True))
+        last_dim = 4 if pose_based else 3
+        if F % last_dim != 0:
+            return torch.ones_like(x_flat, dtype=torch.float32)
+
+        T_any = int(F // last_dim)
+        future_len = int(getattr(self.config, "future_len", 0))
+        if future_len <= 0 or future_len > T_any:
+            return torch.ones_like(x_flat, dtype=torch.float32)
+
+        use_past_dit_input = bool(
+            getattr(self.config, "use_past_dit_input", False))
+        use_current_input = bool(
+            getattr(self.config, "use_current_input", False))
+        time_len = int(getattr(self.config, "time_len", 0))
+
+        if use_past_dit_input:
+            fixed_prefix = max(0, time_len) if pose_based else max(0,
+                                                                   time_len - 1)
+        else:
+            fixed_prefix = 1 if (pose_based and use_current_input) else 0
+
+        start = max(0, T_any - future_len)
+        start = max(start, fixed_prefix)
+
+        valid_all = _to_bool_mask(target_past_cur_future_valid).to(
+            device=x_flat.device)
+
+        if pose_based:
+            node_valid_for_x = valid_all[..., -T_any:]  # (B,P,T_any)
+            step_valid = node_valid_for_x[..., start:T_any]  # (B,P,T_future)
+        else:
+            seg_valid_all = valid_all[..., :-1] & valid_all[
+                ..., 1:]  # (B,P,seg_len)
+            seg_valid_for_x = seg_valid_all[..., -T_any:]  # (B,P,T_any)
+            step_valid = seg_valid_for_x[..., start:T_any]  # (B,P,T_future)
+
+        mask_seq = torch.zeros((B, P, T_any, last_dim), device=x_flat.device,
+                               dtype=torch.float32)
+        mask_seq[..., start:T_any, :] = step_valid.to(torch.float32).unsqueeze(
+            -1)
+        return mask_seq.reshape(B, P, F)
+
     def _compute_guidance_grad_wrt_x(
         self,
         x_t_flat: torch.Tensor,
@@ -1480,8 +1569,23 @@ class Decoder(nn.Module):
             raise RuntimeError(
                 "guidance gradient is None. guidance_fn 내부에서 x와의 연결이 끊겼을 수 있습니다."
             )
+        grad = grad.detach()  # (B,P,F) float32
 
-        return grad.detach()  # (B,P,F) float32
+        # ✅ (추가) 과거/현재/무효는 업데이트하지 않도록 grad 마스크
+        mc = classifier_kwargs.get("model_condition", None)
+        if isinstance(mc, dict):
+            valid_nodes = mc.get("target_past_cur_future_valid", None)
+        else:
+            valid_nodes = None
+
+        if isinstance(valid_nodes, torch.Tensor):
+            mask = self._build_guidance_update_mask_flat(
+                x_flat=x_t_flat,  # (B,P,F)
+                target_past_cur_future_valid=valid_nodes,  # (B,P,time_len+T)
+            )
+            grad = grad * mask.to(device=grad.device, dtype=grad.dtype)
+
+        return grad
 
     def _run_dpm_sampler_for_inference(
         self,
@@ -1654,17 +1758,31 @@ class Decoder(nn.Module):
         t_eff: torch.Tensor = self._compute_amortized_t_eff(t_tau).to(
             device=xT_f32.device, dtype=torch.float32)  # (B,)
 
+        # ✅ (추가) guidance에 더 잘 맞는 대표 시간(가까운 K스텝 평균)
+        t_eff_guidance: torch.Tensor = self._compute_amortized_t_eff_for_guidance(
+            t_tau).to(
+            device=xT_f32.device, dtype=torch.float32
+        )  # (B,)
+
         # (4) (옵션) classifier guidance를 x0에 반영
         x0_guided_flat: torch.Tensor = x0_base_flat
         guidance_scale: float = float(
             getattr(self.config, "guidance_scale", 0.0))
 
         if (self._guidance_fn is not None) and (guidance_scale != 0.0):
+            # ✅ amortized 1-step에서는 x0_pred가 기본으로 안 넘어오므로,
+            #    GuidanceWrapper가 모델을 다시 호출할 때 쓸 t_tau를 전달
+            classifier_kwargs_for_guidance = dict(classifier_kwargs)
+            classifier_kwargs_for_guidance[
+                "diffusion_time_for_guidance"] = t_tau  # (B, future_len)
+            classifier_kwargs_for_guidance[
+                "low_t_mask_for_guidance"] = low_t_mask  # (B,)
             # grad: (B,P,F) float32
+            # ✅ BUGFIX: 실제로 classifier_kwargs_for_guidance를 사용
             grad: torch.Tensor = self._compute_guidance_grad_wrt_x(
-                x_t_flat=xT_f32,  # DPM-Solver에서의 x_t 역할
-                t_eff=t_eff,  # 대표 시간
-                classifier_kwargs=classifier_kwargs,
+                x_t_flat=xT_f32,  # (B,P,F)
+                t_eff=t_eff_guidance,  # (B,)
+                classifier_kwargs=classifier_kwargs_for_guidance,
             )
 
             # scale: (B,1,1) float32

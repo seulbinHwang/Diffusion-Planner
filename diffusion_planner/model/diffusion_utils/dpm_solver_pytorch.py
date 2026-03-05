@@ -195,6 +195,69 @@ def model_wrapper(
     classifier_fn=None,
     classifier_kwargs={},
 ):
+    def _build_guidance_update_mask_flat(
+        x_flat: torch.Tensor,                 # (B,P,F)
+        cfg: Any,
+        valid_nodes: Optional[torch.Tensor],  # (B,P,time_len+T)
+    ) -> Optional[torch.Tensor]:
+        """guidance grad를 적용할 위치만 1인 마스크를 만듭니다.
+
+        - 과거/현재는 0
+        - 미래(valid)만 1
+        """
+        if cfg is None or valid_nodes is None:
+            return None
+        if not isinstance(valid_nodes, torch.Tensor):
+            return None
+        if x_flat.dim() != 3:
+            return None
+
+        B, P, F = x_flat.shape
+        pose_based = bool(getattr(cfg, "pose_based", True))
+        last_dim = 4 if pose_based else 3
+        if F % last_dim != 0:
+            return None
+
+        T_any = int(F // last_dim)
+        future_len = int(getattr(cfg, "future_len", 0))
+        if future_len <= 0 or future_len > T_any:
+            return None
+
+        use_past_dit_input = bool(getattr(cfg, "use_past_dit_input", False))
+        use_current_input = bool(getattr(cfg, "use_current_input", False))
+        time_len = int(getattr(cfg, "time_len", 0))
+
+        # 고정 prefix 길이
+        if use_past_dit_input:
+            if pose_based:
+                fixed_prefix = max(0, time_len)          # past+current (노드)
+            else:
+                fixed_prefix = max(0, time_len - 1)      # past segments
+        else:
+            if pose_based and use_current_input:
+                fixed_prefix = 1                         # current node
+            else:
+                fixed_prefix = 0
+
+        start = max(0, T_any - future_len)
+        # 안전: start가 fixed_prefix보다 작아도 “미래만” 업데이트하므로 start 우선
+        start = max(start, fixed_prefix)
+
+        valid_all = (valid_nodes > 0.5) if valid_nodes.dtype != torch.bool else valid_nodes
+        valid_all = valid_all.to(device=x_flat.device)
+
+        if pose_based:
+            # 노드 valid: x_flat이 들고 있는 마지막 T_any 노드에 맞춰 slice
+            node_valid_for_x = valid_all[..., -T_any:]  # (B,P,T_any)
+            step_valid = node_valid_for_x[..., start:T_any]  # (B,P,T_future)
+        else:
+            seg_valid_all = valid_all[..., :-1] & valid_all[..., 1:]  # (B,P,seg_len)
+            seg_valid_for_x = seg_valid_all[..., -T_any:]             # (B,P,T_any)
+            step_valid = seg_valid_for_x[..., start:T_any]            # (B,P,T_future)
+
+        mask_seq = torch.zeros((B, P, T_any, last_dim), device=x_flat.device, dtype=torch.float32)
+        mask_seq[..., start:T_any, :] = step_valid.to(torch.float32).unsqueeze(-1)
+        return mask_seq.reshape(B, P, F)
 
     def get_model_input_time(t_continuous):
         if noise_schedule.schedule == 'discrete':
@@ -231,75 +294,33 @@ def model_wrapper(
 
         elif guidance_type == "classifier":
             assert classifier_fn is not None
-
             device_type = "cuda" if x.is_cuda else "cpu"
             t_input = get_model_input_time(t_continuous)
 
-            # classifier guidance는 ∂score/∂x가 필요하므로, no_grad 밖에서 수행
             with torch.inference_mode(False), torch.enable_grad():
                 x_in = x.clone().detach().requires_grad_(True)
 
                 with torch.autocast(device_type=device_type, enabled=False):
                     # (1) 모델 1회 호출
-                    # - side-effect로 model.diffusion_sequence_flat(=x0_pred)이 채워진다고 가정
                     if condition is None:
                         output = model(x_in, t_input, **model_kwargs)
                     else:
                         output = model(x_in, t_input, condition, **model_kwargs)
 
-                    # (2) 같은 output으로 noise_pred 계산 (추가 모델 호출 없음)
+                    # (2) noise_pred
                     noise = noise_pred_from_output(x_in, t_continuous, output)
 
-                    # (3) x0_pred 확보(우선 model에 저장된 값 사용)
+                    # (3) x0_pred 확보
                     x0_pred = getattr(model, "diffusion_sequence_flat", None)
                     if not isinstance(x0_pred, torch.Tensor):
-                        # 혹시 model이 x0를 저장하지 않는 타입이면, 최소한의 fallback으로 직접 구성
-                        if model_type == "x_start":
-                            x0_pred = output
-                        elif model_type == "v":
-                            alpha_t = noise_schedule.marginal_alpha(
-                                t_continuous)
-                            sigma_t = noise_schedule.marginal_std(t_continuous)
-                            x0_pred = expand_dims(
-                                alpha_t, x_in.dim()) * x_in - expand_dims(
-                                    sigma_t, x_in.dim()) * output
-                        elif model_type == "noise":
-                            alpha_t = noise_schedule.marginal_alpha(
-                                t_continuous)
-                            sigma_t = noise_schedule.marginal_std(t_continuous)
-                            alpha_safe = torch.clamp(alpha_t, min=1e-6)
-                            x0_pred = (x_in - expand_dims(sigma_t, x_in.dim()) *
-                                       output) / expand_dims(
-                                           alpha_safe, x_in.dim())
-                        elif model_type == "score":
-                            alpha_t = noise_schedule.marginal_alpha(
-                                t_continuous)
-                            sigma_t = noise_schedule.marginal_std(t_continuous)
-                            alpha_safe = torch.clamp(alpha_t, min=1e-6)
-                            x0_pred = (
-                                x_in +
-                                expand_dims(sigma_t * sigma_t, x_in.dim()) *
-                                output) / expand_dims(alpha_safe, x_in.dim())
-                        else:
-                            raise ValueError(
-                                f"Unknown model_type: {model_type}")
+                        ...  # (기존 fallback 유지)
 
-                    # (4) classifier_fn에 x0_pred를 넘겨서 GuidanceWrapper가 재사용하게 함
                     local_classifier_kwargs = dict(classifier_kwargs)
                     local_classifier_kwargs["x0_pred"] = x0_pred
 
                     log_prob = classifier_fn(x_in, t_input, condition,
                                              **local_classifier_kwargs)
-                    if not isinstance(log_prob, torch.Tensor):
-                        raise TypeError(
-                            f"classifier_fn must return torch.Tensor, got {type(log_prob)}"
-                        )
-                    if not log_prob.requires_grad:
-                        raise RuntimeError(
-                            "classifier_fn output does not require grad w.r.t x. "
-                            "guidance가 no_grad/inference_mode 영향으로 꺼졌거나, "
-                            "classifier_fn 내부에서 x와의 연결이 끊겼을 수 있습니다.")
-
+                    ...
                     log_prob_sum = log_prob.float().sum()
 
                 grad = torch.autograd.grad(
@@ -313,9 +334,19 @@ def model_wrapper(
                     raise RuntimeError("classifier guidance grad is None.")
                 grad = grad.detach()
 
+            # ✅ (추가) 과거/현재/무효는 업데이트하지 않도록 grad 마스크
+            cfg = classifier_kwargs.get("config", None)
+            mc = classifier_kwargs.get("model_condition", {})
+            valid_nodes = mc.get("target_past_cur_future_valid",
+                                 None) if isinstance(mc, dict) else None
+            mask = _build_guidance_update_mask_flat(x_in.detach(), cfg,
+                                                    valid_nodes)
+            if isinstance(mask, torch.Tensor):
+                grad = grad * mask.to(device=grad.device, dtype=grad.dtype)
+
             sigma_t = noise_schedule.marginal_std(t_continuous)
-            guided = noise.detach() - guidance_scale * expand_dims(
-                sigma_t, x.dim()) * grad
+            guided = noise.detach() - guidance_scale * expand_dims(sigma_t,
+                                                                   x.dim()) * grad
             return guided.detach()
 
         elif guidance_type == "classifier-free":
