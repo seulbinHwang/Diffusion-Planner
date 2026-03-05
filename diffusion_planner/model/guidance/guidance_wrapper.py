@@ -68,14 +68,18 @@ class GuidanceWrapper:
             B = int(x_in.shape[0])
             low_t_mask = torch.ones((B,), device=x_in.device, dtype=torch.bool)
 
-        # 모델 재호출(grad 흐름 유지)
-        _ = model(
-            x_in,
-            diffusion_time,
-            **model_condition,
-            low_t_mask=low_t_mask,
-        )
-
+        device_type = "cuda" if x_in.is_cuda else "cpu"
+        with torch.autocast(
+                device_type=device_type,
+                dtype=torch.bfloat16,
+                enabled=(device_type == "cuda"),
+        ):
+            _ = model(
+                x_in,
+                diffusion_time,
+                **model_condition,
+                low_t_mask=low_t_mask,
+            )
         x0_new = getattr(model, "diffusion_sequence_flat", None)
         if not isinstance(x0_new, torch.Tensor):
             raise RuntimeError("GuidanceWrapper: model.diffusion_sequence_flat을 얻지 못했습니다.")
@@ -100,6 +104,7 @@ class GuidanceWrapper:
         Returns:
             torch.Tensor: (B,) 점수 텐서
         """
+        print("GuidanceWrapper:")
         if x_in.dim() != 3:
             raise ValueError(f"GuidanceWrapper: x_in must be (B,P,F). got {tuple(x_in.shape)}")
         if t_input.dim() != 1:

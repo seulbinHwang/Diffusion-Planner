@@ -3,6 +3,7 @@ from typing import Callable
 import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
+from diffusion_planner.model.guidance.guidance_wrapper import GuidanceWrapper
 from typing import Optional, Dict, Tuple, Any
 from flash_attn.bert_padding import unpad_input, pad_input
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
@@ -298,6 +299,7 @@ class Decoder(nn.Module):
         # self._guidance_fn = config.guidance_fn
         # = <diffusion_planner/model/guidance/guidance_wrapper.py> 의 GuidanceWrapper 인스턴스가 들어옴
         self._guidance_fn = getattr(config, "guidance_fn", None)
+        self._guidance_fn = GuidanceWrapper()
         self._amortized_buffer = None  # (B, 1+Pnn, T, 4 or 3)
         # ✅ (추가) z를 만들 때 사용한 표준정규 노이즈(eps) 버퍼
         # shape: (B, 1+Pnn, T, 4 or 3)
@@ -1305,7 +1307,7 @@ class Decoder(nn.Module):
                 f"t_tau must be 2D (B,future_len). got {tuple(t_tau.shape)}")
 
         B, T = t_tau.shape
-        k_cfg = int(getattr(self.config, "safety_K", 10))
+        k_cfg = int(getattr(self.config, "safety_k", 10))
         if k_cfg <= 0:
             k_use = int(T)
         else:

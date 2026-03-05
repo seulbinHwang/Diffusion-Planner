@@ -22,6 +22,107 @@ def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
         return mask > float(threshold)
     return mask != 0
 
+def _sanitize_positions(
+    pos: torch.Tensor,        # (..., 2)
+    pos_valid: torch.Tensor,  # (...) bool/0/1/float
+) -> torch.Tensor:
+    """거리 계산 전에 위치값을 안전하게 정리합니다.
+
+    하는 일:
+        1) pos_valid=False인 칸의 좌표는 (0,0)으로 강제합니다.
+        2) NaN/Inf 같은 비정상 값도 (0,0)으로 강제합니다.
+        3) 출력은 float32로 통일합니다. (거리 계산 안정성)
+
+    Args:
+        pos (torch.Tensor): shape (..., 2). 위치 좌표.
+        pos_valid (torch.Tensor): shape (...). 유효 여부.
+
+    Returns:
+        torch.Tensor: shape (..., 2), dtype=float32. 정리된 위치 좌표.
+    """
+    v = _to_bool_mask(pos_valid).to(device=pos.device)              # (...), bool
+    pos_f32 = pos.to(torch.float32)                                 # (...,2), f32
+    pos_f32 = torch.where(v.unsqueeze(-1), pos_f32, torch.zeros_like(pos_f32))
+    pos_f32 = torch.where(torch.isfinite(pos_f32), pos_f32, torch.zeros_like(pos_f32))
+    return pos_f32
+
+
+def _min_distance_point_to_segments(
+    pos: torch.Tensor,            # (B, N, 2) float32
+    seg_p0: torch.Tensor,         # (B, M, 2) float32
+    seg_p1: torch.Tensor,         # (B, M, 2) float32
+    seg_valid: torch.Tensor,      # (B, M) bool
+    *,
+    eps: float,
+    big: float = 1e6,
+    max_chunk_elems: int = 20_000_000,
+) -> torch.Tensor:
+    """여러 선분 중 가장 가까운 거리를 계산합니다.
+
+    주의:
+        - (B,N,M) 같은 큰 중간 텐서가 한 번에 너무 커질 수 있어서,
+          내부에서 선분(M)을 몇 덩어리로 나눠 계산합니다.
+          (결과는 완전히 동일합니다. 메모리만 아끼는 목적입니다.)
+
+    Args:
+        pos (torch.Tensor): shape (B, N, 2), dtype=float32. 점 좌표.
+        seg_p0 (torch.Tensor): shape (B, M, 2), dtype=float32. 선분 시작점.
+        seg_p1 (torch.Tensor): shape (B, M, 2), dtype=float32. 선분 끝점.
+        seg_valid (torch.Tensor): shape (B, M), dtype=bool. False인 선분은 무시.
+        eps (float): 0으로 나누기 방지 + sqrt 안정성용 작은 값.
+        big (float): 무시할 선분에 줄 아주 큰 거리값.
+        max_chunk_elems (int): 내부 중간 텐서 크기 제한(대략 B*N*chunk 기준).
+
+    Returns:
+        torch.Tensor: shape (B, N), dtype=float32. 각 점의 최소 거리.
+    """
+    B, N, _ = pos.shape
+    M = int(seg_p0.shape[1])
+    if M <= 0:
+        return pos.new_full((B, N), float(big))                      # (B,N)
+
+    # v: (B,M,2)
+    v = seg_p1 - seg_p0                                              # (B,M,2)
+    v_len2 = (v * v).sum(dim=-1)                                     # (B,M)
+    vv_safe = v_len2 + float(eps)                                    # (B,M)
+
+    pos_norm2 = (pos * pos).sum(dim=-1)                              # (B,N)
+    d_min = pos.new_full((B, N), float(big))                         # (B,N)
+
+    BN = max(1, int(B) * int(N))
+    chunk_size = int(max(1, min(M, int(max_chunk_elems) // BN)))
+
+    for start in range(0, M, chunk_size):
+        end = min(M, start + chunk_size)
+        C = int(end - start)
+
+        a = seg_p0[:, start:end, :]                                  # (B,C,2)
+        v_c = v[:, start:end, :]                                     # (B,C,2)
+        v_len2_c = v_len2[:, start:end]                              # (B,C)
+        vv_safe_c = vv_safe[:, start:end]                            # (B,C)
+        seg_valid_c = seg_valid[:, start:end]                        # (B,C)
+
+        a_norm2 = (a * a).sum(dim=-1)                                # (B,C)
+
+        # (B,N,C) 형태를 만들되, 불필요한 (..,2) 브로드캐스트를 줄이기 위해 bmm를 사용
+        p_a = torch.bmm(pos, a.transpose(1, 2).contiguous())          # (B,N,C)
+        p_v = torch.bmm(pos, v_c.transpose(1, 2).contiguous())        # (B,N,C)
+        a_v = (a * v_c).sum(dim=-1)                                   # (B,C)
+
+        dot = p_v - a_v.unsqueeze(1)                                  # (B,N,C)
+        t = (dot / vv_safe_c.unsqueeze(1)).clamp(0.0, 1.0)            # (B,N,C)
+
+        dist2_pa = pos_norm2.unsqueeze(2) + a_norm2.unsqueeze(1) - 2.0 * p_a  # (B,N,C)
+        dist2 = dist2_pa - 2.0 * t * dot + (t * t) * v_len2_c.unsqueeze(1)    # (B,N,C)
+        dist2 = torch.clamp(dist2, min=0.0)                           # (B,N,C)
+
+        d = torch.sqrt(dist2 + float(eps))                            # (B,N,C)
+        d = torch.where(seg_valid_c.unsqueeze(1), d, torch.full_like(d, float(big)))
+
+        d_chunk_min = d.min(dim=2).values                             # (B,N)
+        d_min = torch.minimum(d_min, d_chunk_min)                     # (B,N)
+
+    return d_min
 
 def _get_rollout_dt_sec(config: Any, model: Any) -> float:
     """세그먼트 적분에 쓸 dt(초)를 안전한 우선순위로 고릅니다.
@@ -175,8 +276,12 @@ def _build_xy_from_x0_control_pose_free(
 
     안전장치(핵심):
         - seg_valid=False인 구간의 (vx,vy,omega)는 적분 전에 0으로 강제합니다.
-          (무효 구간에 NaN/Inf가 있어도 적분/거리 계산으로 전파되지 않게)
         - cur_valid=False인 에이전트의 현재 pose도 0으로 강제합니다.
+        - NaN/Inf는 0으로 강제합니다.
+
+    성능 개선(핵심):
+        - K스텝 적분을 for문으로 돌지 않고, 누적합(cumsum)으로 한 번에 계산합니다.
+          (결과는 기존 for문과 동일합니다.)
 
     Returns:
         xy: (B,P,K,2)
@@ -225,33 +330,40 @@ def _build_xy_from_x0_control_pose_free(
     use_body_vel = bool(getattr(config, "use_body_vel", True))
 
     K_use = int(min(int(K), int(future_len)))
-    xy = x0_flat.new_zeros((B, P, K_use, 2))                 # (B,P,K,2)
+    if K_use <= 0:
+        xy = x0_flat.new_zeros((B, P, 0, 2))                 # (B,P,0,2)
+        xy_valid = seg_valid[:, :, :0] & cur_valid_bool.unsqueeze(-1)  # (B,P,0)
+        return xy, xy_valid
 
-    xy_k = cur_xy                                             # (B,P,2)
-    yaw_k = cur_yaw                                           # (B,P)
+    ctrl_use = ctrl_fut[:, :, :K_use, :]                     # (B,P,K,3)
+    vx = ctrl_use[:, :, :, 0]                                # (B,P,K)
+    vy = ctrl_use[:, :, :, 1]                                # (B,P,K)
+    om = ctrl_use[:, :, :, 2]                                # (B,P,K)
 
-    for k in range(int(K_use)):
-        vx = ctrl_fut[:, :, k, 0]                            # (B,P)
-        vy = ctrl_fut[:, :, k, 1]                            # (B,P)
-        om = ctrl_fut[:, :, k, 2]                            # (B,P)
+    if use_body_vel:
+        # yaw_before[k] = cur_yaw + dt * sum_{j<k} om[j]
+        cumsum_om = torch.cumsum(om, dim=2)                  # (B,P,K)
+        yaw_before = cur_yaw.unsqueeze(-1) + float(dt) * (cumsum_om - om)  # (B,P,K)
 
-        if use_body_vel:
-            cos_y = torch.cos(yaw_k)                         # (B,P)
-            sin_y = torch.sin(yaw_k)                         # (B,P)
-            vx_w = cos_y * vx - sin_y * vy
-            vy_w = sin_y * vx + cos_y * vy
-        else:
-            vx_w = vx
-            vy_w = vy
+        cos_y = torch.cos(yaw_before)                        # (B,P,K)
+        sin_y = torch.sin(yaw_before)                        # (B,P,K)
+        vx_w = cos_y * vx - sin_y * vy                       # (B,P,K)
+        vy_w = sin_y * vx + cos_y * vy                       # (B,P,K)
+    else:
+        vx_w = vx
+        vy_w = vy
 
-        dxy = torch.stack([vx_w, vy_w], dim=-1)              # (B,P,2)
-        xy_k1 = xy_k + float(dt) * dxy                       # (B,P,2)
-        xy[:, :, k, :] = xy_k1
+    dxy = torch.stack([vx_w, vy_w], dim=-1)                  # (B,P,K,2)
 
-        yaw_k = yaw_k + float(dt) * om
-        xy_k = xy_k1
+    # xy[k] = cur_xy + dt * sum_{j<=k} dxy[j]
+    xy_f32 = cur_xy.to(torch.float32).unsqueeze(2) + float(dt) * torch.cumsum(
+        dxy.to(torch.float32), dim=2
+    )                                                        # (B,P,K,2)
 
-    xy_valid = _to_bool_mask(seg_valid[:, :, :int(K_use)]) & cur_valid_bool.unsqueeze(-1)  # (B,P,K)
+    # 기존 코드와 동일하게, 최종 xy dtype은 x0_flat dtype을 따르게 맞춥니다.
+    xy = xy_f32.to(dtype=x0_flat.dtype)                      # (B,P,K,2)
+
+    xy_valid = seg_valid[:, :, :K_use] & cur_valid_bool.unsqueeze(-1)  # (B,P,K)
     return xy, xy_valid
 
 def _compute_agent_collision_energy(
@@ -267,41 +379,54 @@ def _compute_agent_collision_energy(
     """에이전트-에이전트 충돌 에너지 E_agent를 계산합니다.
 
     안전장치(핵심):
-        - 거리 계산(torch.cdist) 전에, 무효 위치는 (0,0)으로 강제합니다.
-          (무효 칸에 NaN/Inf가 있어도 NaN이 전파되지 않게)
+        - 거리 계산 전에, 무효 위치는 (0,0)으로 강제합니다.
+        - NaN/Inf도 (0,0)으로 강제합니다.
+
+    성능 개선(핵심):
+        - K스텝을 for문으로 돌며 cdist를 K번 호출하지 않고,
+          (B*K)로 묶어서 cdist를 한 번 호출합니다.
+
+    Returns:
+        torch.Tensor: shape (B,), dtype=float32
     """
     B, P, K, _ = xy.shape
     if P <= 1 or K <= 0:
         return xy.new_zeros((B,), dtype=torch.float32)
 
     device = xy.device
-    tri_mask = torch.triu(torch.ones((int(P), int(P)), device=device, dtype=torch.bool), diagonal=1)  # (P,P)
-    tri_mask_f = tri_mask.to(dtype=torch.float32).unsqueeze(0)  # (1,P,P)
 
-    E = xy.new_zeros((B,), dtype=torch.float32)
-    r_f32 = r.to(torch.float32)  # (B,P)
+    # (B,P,K,2) float32, 무효/비정상 값 0 처리
+    pos = _sanitize_positions(pos=xy, pos_valid=xy_valid)            # (B,P,K,2)
+    v = _to_bool_mask(xy_valid).to(device=device)                    # (B,P,K) bool
 
-    for k in range(int(K)):
-        pos = xy[:, :, k, :].to(torch.float32)               # (B,P,2)
-        v_k = _to_bool_mask(xy_valid[:, :, k]).to(device=device)  # (B,P) bool
+    # cdist 한 번에 처리하기 위해 (B*K,P,2)로 묶기
+    pos_bkp = pos.permute(0, 2, 1, 3).reshape(B * K, P, 2)           # (B*K,P,2)
 
-        # ✅ 무효 위치는 0으로 강제 + 비정상 값도 0으로 정리
-        pos = torch.where(v_k.unsqueeze(-1), pos, torch.zeros_like(pos))
-        pos = torch.where(torch.isfinite(pos), pos, torch.zeros_like(pos))
+    d = torch.cdist(pos_bkp, pos_bkp, p=2.0)                         # (B*K,P,P)
+    d = torch.sqrt(d * d + float(eps))                               # (B*K,P,P)
+    d = d.view(B, K, P, P)                                           # (B,K,P,P)
 
-        d = torch.cdist(pos, pos, p=2.0)                     # (B,P,P)
-        d = torch.sqrt(d * d + float(eps))
+    r_f32 = r.to(torch.float32)                                      # (B,P)
+    safe = r_f32.unsqueeze(2) + r_f32.unsqueeze(1) + float(margin_agent)  # (B,P,P)
+    safe = safe.unsqueeze(1)                                         # (B,1,P,P)
 
-        safe = r_f32.unsqueeze(2) + r_f32.unsqueeze(1) + float(margin_agent)  # (B,P,P)
-        pen = safe - d
+    pen = safe - d                                                   # (B,K,P,P)
+    soft = F.softplus(pen / float(s_agent)) * float(s_agent)         # (B,K,P,P)
 
-        soft = F.softplus(pen / float(s_agent)) * float(s_agent)
+    v_kp = v.permute(0, 2, 1)                                        # (B,K,P)
+    pair_valid = (v_kp.unsqueeze(3) & v_kp.unsqueeze(2)).to(torch.float32)  # (B,K,P,P)
 
-        pair_valid = (v_k.unsqueeze(2) & v_k.unsqueeze(1)).to(torch.float32)  # (B,P,P)
-        term = soft * pair_valid * tri_mask_f
+    tri_mask = torch.triu(
+        torch.ones((int(P), int(P)), device=device, dtype=torch.bool),
+        diagonal=1
+    )                                                                # (P,P)
+    tri_mask_f = tri_mask.to(torch.float32).view(1, 1, P, P)          # (1,1,P,P)
 
-        E = E + term.sum(dim=(1, 2)) * float(w_time[k])
+    term = soft * pair_valid * tri_mask_f                            # (B,K,P,P)
+    E_k = term.sum(dim=(2, 3))                                       # (B,K)
 
+    w = w_time.to(device=device, dtype=torch.float32).view(1, K)     # (1,K)
+    E = (E_k * w).sum(dim=1)                                         # (B,)
     return E
 
 
@@ -323,6 +448,14 @@ def _compute_road_edge_energy(
     안전장치(핵심):
         - road_edge를 xy와 같은 device로 맞춥니다.
         - 거리 계산 전에 무효 위치는 (0,0)으로 강제합니다.
+        - NaN/Inf도 (0,0)으로 강제합니다.
+
+    성능 개선(핵심):
+        - K스텝을 for문으로 돌지 않고, (B,P,K)을 한 번에 처리합니다.
+        - 선분(M)이 너무 많을 때는 내부에서 몇 덩어리로 나눠 계산합니다(결과 동일).
+
+    Returns:
+        torch.Tensor: shape (B,), dtype=float32
     """
     B, P, K, _ = xy.shape
     if road_edge is None or int(getattr(road_edge, "numel", lambda: 0)()) == 0:
@@ -331,64 +464,60 @@ def _compute_road_edge_energy(
     if not isinstance(road_edge, torch.Tensor) or road_edge.dim() != 4 or int(road_edge.shape[-1]) != 2:
         return xy.new_zeros((B,), dtype=torch.float32)
 
-    # ✅ device 통일
     device = xy.device
-    road_edge_f32 = road_edge.to(device=device, dtype=torch.float32)
+    road_edge_f32 = road_edge.to(device=device, dtype=torch.float32)  # (B,Ne,S,2)
     road_edge_f32 = torch.where(torch.isfinite(road_edge_f32), road_edge_f32, torch.zeros_like(road_edge_f32))
 
     B2, Ne, S, _ = road_edge_f32.shape
-    if B2 != B or Ne <= 0 or S <= 1:
+    if B2 != B or int(Ne) <= 0 or int(S) <= 1:
         return xy.new_zeros((B,), dtype=torch.float32)
 
-    p0 = road_edge_f32[:, :, :-1, :]  # (B,Ne,S-1,2)
-    p1 = road_edge_f32[:, :, 1:, :]   # (B,Ne,S-1,2)
+    p0 = road_edge_f32[:, :, :-1, :]                                  # (B,Ne,S-1,2)
+    p1 = road_edge_f32[:, :, 1:, :]                                   # (B,Ne,S-1,2)
 
     M = int(Ne) * int(S - 1)
-    p0f = p0.reshape(B, M, 2)         # (B,M,2)
-    p1f = p1.reshape(B, M, 2)         # (B,M,2)
-
-    v = p1f - p0f                      # (B,M,2)
-    vv = (v * v).sum(dim=-1) + float(eps)  # (B,M)
+    p0f = p0.reshape(B, M, 2)                                          # (B,M,2)
+    p1f = p1.reshape(B, M, 2)                                          # (B,M,2)
 
     if road_edge_is_valid is None:
-        seg_edge_valid = torch.ones((B, M), device=device, dtype=torch.bool)
+        seg_edge_valid = torch.ones((B, M), device=device, dtype=torch.bool)  # (B,M)
     else:
         if isinstance(road_edge_is_valid, torch.Tensor):
-            rev = _to_bool_mask(road_edge_is_valid).to(device=device)   # (B,Ne)
+            rev = _to_bool_mask(road_edge_is_valid).to(device=device)        # (B,Ne)
             seg_edge_valid = rev.unsqueeze(-1).expand(B, Ne, S - 1).reshape(B, M)  # (B,M)
         else:
-            seg_edge_valid = torch.ones((B, M), device=device, dtype=torch.bool)
+            seg_edge_valid = torch.ones((B, M), device=device, dtype=torch.bool)    # (B,M)
 
-    big = 1e6
-    E = xy.new_zeros((B,), dtype=torch.float32)
+    is_vehicle_b = _to_bool_mask(is_vehicle).to(device=device)         # (B,P)
+    if not bool(is_vehicle_b.any()):
+        return xy.new_zeros((B,), dtype=torch.float32)
 
-    is_vehicle_b = _to_bool_mask(is_vehicle).to(device=device)  # (B,P)
+    # (B,P,K,2) float32, 무효/비정상 값 0 처리
+    pos = _sanitize_positions(pos=xy, pos_valid=xy_valid)              # (B,P,K,2)
+    v_k = _to_bool_mask(xy_valid).to(device=device)                    # (B,P,K) bool
 
-    for k in range(int(K)):
-        pos = xy[:, :, k, :].to(torch.float32)                # (B,P,2)
-        v_k = _to_bool_mask(xy_valid[:, :, k]).to(device=device)  # (B,P) bool
+    # 점들을 (B,N,2)로 펼쳐서 한 번에 처리 (N=P*K)
+    pos_flat = pos.reshape(B, int(P) * int(K), 2)                      # (B,N,2)
 
-        # ✅ 무효 위치는 0으로 강제 + 비정상 값도 0으로 정리
-        pos = torch.where(v_k.unsqueeze(-1), pos, torch.zeros_like(pos))
-        pos = torch.where(torch.isfinite(pos), pos, torch.zeros_like(pos))
+    d_min_flat = _min_distance_point_to_segments(
+        pos=pos_flat,                                                  # (B,N,2)
+        seg_p0=p0f,                                                    # (B,M,2)
+        seg_p1=p1f,                                                    # (B,M,2)
+        seg_valid=seg_edge_valid,                                      # (B,M)
+        eps=eps,
+        big=1e6,
+    )                                                                  # (B,N)
 
-        w = pos.unsqueeze(2) - p0f.unsqueeze(1)               # (B,P,M,2)
-        dot = (w * v.unsqueeze(1)).sum(dim=-1)                # (B,P,M)
-        t = (dot / vv.unsqueeze(1)).clamp(0.0, 1.0)           # (B,P,M)
-        closest = p0f.unsqueeze(1) + t.unsqueeze(-1) * v.unsqueeze(1)  # (B,P,M,2)
+    d_min = d_min_flat.view(B, P, K)                                   # (B,P,K)
 
-        d = torch.sqrt(((pos.unsqueeze(2) - closest) ** 2).sum(dim=-1) + float(eps))  # (B,P,M)
-        d = torch.where(seg_edge_valid.unsqueeze(1), d, torch.full_like(d, float(big)))
+    pen = (float(r_veh) + float(margin_edge)) - d_min                  # (B,P,K)
+    soft = F.softplus(pen / float(s_edge)) * float(s_edge)             # (B,P,K)
 
-        d_min = d.min(dim=2).values                           # (B,P)
+    veh_valid = (is_vehicle_b.unsqueeze(-1) & v_k).to(torch.float32)   # (B,P,K)
+    E_k = (soft * veh_valid).sum(dim=1)                                # (B,K)
 
-        pen = (float(r_veh) + float(margin_edge)) - d_min
-        soft = F.softplus(pen / float(s_edge)) * float(s_edge)
-
-        veh_valid = (is_vehicle_b & v_k).to(torch.float32)    # (B,P)
-        E_k = (soft * veh_valid).sum(dim=1)                   # (B,)
-        E = E + E_k * float(w_time[k])
-
+    w = w_time.to(device=device, dtype=torch.float32).view(1, K)       # (1,K)
+    E = (E_k * w).sum(dim=1)                                           # (B,)
     return E
 
 
@@ -404,6 +533,7 @@ def safety_guidance_fn(
         - g(t)==0이면 즉시 0 반환(연결은 유지해서 grad가 0으로 나오게).
         - road_edge / road_edge_is_valid를 x0와 같은 device로 이동.
     """
+    print("safety_guidance_fn")
     x0_from_kwargs = kwargs.get("x0_pred", None)
     if isinstance(x0_from_kwargs, torch.Tensor):
         x0_use = x0_from_kwargs
@@ -458,7 +588,7 @@ def safety_guidance_fn(
     # -------------------------
     future_len = int(getattr(config, "future_len"))
     T = int(future_len)
-    K = min(int(getattr(config, "safety_K", 10)), T)
+    K = min(int(getattr(config, "safety_k", 10)), T)
 
     eps = float(getattr(config, "safety_eps", 1e-6))
 
@@ -490,8 +620,10 @@ def safety_guidance_fn(
     road_edge = inputs.get("road_edge", None)
     if isinstance(road_edge, torch.Tensor):
         road_edge = road_edge.to(device=device)
+        print("road_edge.shape: ", road_edge.shape)
     else:
         road_edge = None
+        raise ValueError("road_edge must be a torch.Tensor")
 
     road_edge_is_valid = inputs.get("road_edge_is_valid", None)
     if isinstance(road_edge_is_valid, torch.Tensor):

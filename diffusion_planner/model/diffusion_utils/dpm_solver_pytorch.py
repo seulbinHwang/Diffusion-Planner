@@ -1,5 +1,5 @@
 import torch
-
+from typing import Any, Optional
 
 class NoiseScheduleVP:
 
@@ -292,61 +292,131 @@ def model_wrapper(
             output = model(x, t_input, **model_kwargs)
             return noise_pred_from_output(x, t_continuous, output)
 
+
         elif guidance_type == "classifier":
+
             assert classifier_fn is not None
+
             device_type = "cuda" if x.is_cuda else "cpu"
+
             t_input = get_model_input_time(t_continuous)
 
             with torch.inference_mode(False), torch.enable_grad():
+
                 x_in = x.clone().detach().requires_grad_(True)
 
-                with torch.autocast(device_type=device_type, enabled=False):
-                    # (1) 모델 1회 호출
+                # ---------------------------------------------------------
+
+                # (1) ✅ 모델 forward는 bf16 autocast로 실행
+
+                #     - 여기서는 "모델 내부 LayerNorm/FlashAttention/MLP"가
+
+                #       bf16 기준으로 정상 동작하도록 보장하는 구간입니다.
+
+                # ---------------------------------------------------------
+
+                with torch.autocast(
+
+                        device_type=device_type,
+
+                        dtype=torch.bfloat16,
+
+                        enabled=(device_type == "cuda"),
+
+                ):
+
                     if condition is None:
+
                         output = model(x_in, t_input, **model_kwargs)
+
                     else:
+
                         output = model(x_in, t_input, condition, **model_kwargs)
 
-                    # (2) noise_pred
-                    noise = noise_pred_from_output(x_in, t_continuous, output)
-
                     # (3) x0_pred 확보
+
                     x0_pred = getattr(model, "diffusion_sequence_flat", None)
+
                     if not isinstance(x0_pred, torch.Tensor):
                         ...  # (기존 fallback 유지)
 
+                # ---------------------------------------------------------
+
+                # (2) ✅ guidance 점수/그라드 계산만 fp32(autocast off)로 실행
+
+                #     - 수치 안정성 목적 (기존 의도 유지)
+
+                # ---------------------------------------------------------
+
+                with torch.autocast(device_type=device_type, enabled=False):
+
+                    # noise는 grad가 필요 없으니 detach로 그래프 부하를 줄입니다.
+
+                    noise = noise_pred_from_output(
+
+                        x_like=x_in.detach(),
+
+                        t_continuous_like=t_continuous,
+
+                        output_like=output.detach(),
+
+                    )
+
                     local_classifier_kwargs = dict(classifier_kwargs)
+
                     local_classifier_kwargs["x0_pred"] = x0_pred
 
-                    log_prob = classifier_fn(x_in, t_input, condition,
-                                             **local_classifier_kwargs)
-                    ...
+                    try:
+
+                        log_prob = classifier_fn(x_in, t_input, condition,
+                                                 **local_classifier_kwargs)
+
+                    except TypeError:
+
+                        log_prob = classifier_fn(x_in, t_input,
+                                                 **local_classifier_kwargs)
+
                     log_prob_sum = log_prob.float().sum()
 
                 grad = torch.autograd.grad(
+
                     outputs=log_prob_sum,
+
                     inputs=x_in,
+
                     retain_graph=False,
+
                     create_graph=False,
+
                     allow_unused=False,
+
                 )[0]
+
                 if grad is None:
                     raise RuntimeError("classifier guidance grad is None.")
+
                 grad = grad.detach()
 
-            # ✅ (추가) 과거/현재/무효는 업데이트하지 않도록 grad 마스크
+            # ✅ (추가) 과거/현재/무효는 업데이트하지 않도록 grad 마스크 (기존 유지)
+
             cfg = classifier_kwargs.get("config", None)
+
             mc = classifier_kwargs.get("model_condition", {})
+
             valid_nodes = mc.get("target_past_cur_future_valid",
                                  None) if isinstance(mc, dict) else None
+
             mask = _build_guidance_update_mask_flat(x_in.detach(), cfg,
                                                     valid_nodes)
+
             if isinstance(mask, torch.Tensor):
                 grad = grad * mask.to(device=grad.device, dtype=grad.dtype)
 
             sigma_t = noise_schedule.marginal_std(t_continuous)
+
             guided = noise.detach() - guidance_scale * expand_dims(sigma_t,
                                                                    x.dim()) * grad
+
             return guided.detach()
 
         elif guidance_type == "classifier-free":

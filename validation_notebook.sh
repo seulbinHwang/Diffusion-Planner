@@ -199,7 +199,13 @@ taskset -c "${CPUSET}" \
   --profile_feasible False \
   --use_feasible True \
   --use_feasible_dl False \
-  --use_feasible_filter True \
+  --use_guidance True \
+  --guidance_scale 8.0 \
+  --safety_lambda_agent 0.0 \
+  --safety_tau_time 20.0 \
+  --safety_t_th 1.0 \
+  --safety_k 80 \
+  --use_feasible_filter False \
   --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \

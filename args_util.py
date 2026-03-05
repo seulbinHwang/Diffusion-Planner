@@ -655,6 +655,17 @@ def get_args():
     parser.add_argument('--use_recovery', default=False, type=boolean)
     parser.add_argument('--recovery_threshold_m', type=float, default=3.)
     parser.add_argument('--guidance_scale', type=float, default=1.)
+    parser.add_argument('--safety_t_th', type=float, default=0.5)
+    parser.add_argument('--safety_gate_p', type=float, default=2.)
+    parser.add_argument('--safety_k', type=int, default=8)
+    parser.add_argument('--safety_tau_time', type=float, default=3.0)
+    parser.add_argument('--safety_lambda_agent', type=float, default=1.0)
+    parser.add_argument('--safety_lambda_edge', type=float, default=1.0)
+    parser.add_argument('--safety_r_veh', type=float, default=1.0)
+    parser.add_argument('--safety_r_ped', type=float, default=0.35)
+    parser.add_argument('--safety_r_bike', type=float, default=0.55)
+    parser.add_argument('--safety_margin_agent', type=float, default=0.2)
+    parser.add_argument('--safety_margin_edge', type=float, default=0.3)
     parser.add_argument('--dp_sample_k_candidate_batch_size',
                         type=float,
                         default=-1.)
