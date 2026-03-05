@@ -195,198 +195,149 @@ def model_wrapper(
     classifier_fn=None,
     classifier_kwargs={},
 ):
-    """Create a wrapper function for the noise prediction model.
-
-    DPM-Solver needs to solve the continuous-time diffusion ODEs. For DPMs trained on discrete-time labels, we need to
-    firstly wrap the model function to a noise prediction model that accepts the continuous time as the input.
-
-    We support four types of the diffusion model by setting `model_type`:
-
-        1. "noise": noise prediction model. (Trained by predicting noise).
-
-        2. "x_start": data prediction model. (Trained by predicting the data x_0 at time 0).
-
-        3. "v": velocity prediction model. (Trained by predicting the velocity).
-            The "v" prediction is derivation detailed in Appendix D of [1], and is used in Imagen-Video [2].
-
-            [1] Salimans, Tim, and Jonathan Ho. "Progressive distillation for fast sampling of diffusion models."
-                arXiv preprint arXiv:2202.00512 (2022).
-            [2] Ho, Jonathan, et al. "Imagen Video: High Definition Video Generation with Diffusion Models."
-                arXiv preprint arXiv:2210.02303 (2022).
-    
-        4. "score": marginal score function. (Trained by denoising score matching).
-            Note that the score function and the noise prediction model follows a simple relationship:
-            ```
-                noise(x_t, t) = -sigma_t * score(x_t, t)
-            ```
-
-    We support three types of guided sampling by DPMs by setting `guidance_type`:
-        1. "uncond": unconditional sampling by DPMs.
-            The input `model` has the following format:
-            ``
-                model(x, t_input, **model_kwargs) -> noise | x_start | v | score
-            ``
-
-        2. "classifier": classifier guidance sampling [3] by DPMs and another classifier.
-            The input `model` has the following format:
-            ``
-                model(x, t_input, **model_kwargs) -> noise | x_start | v | score
-            `` 
-
-            The input `classifier_fn` has the following format:
-            ``
-                classifier_fn(x, t_input, cond, **classifier_kwargs) -> logits(x, t_input, cond)
-            ``
-
-            [3] P. Dhariwal and A. Q. Nichol, "Diffusion models beat GANs on image synthesis,"
-                in Advances in Neural Information Processing Systems, vol. 34, 2021, pp. 8780-8794.
-
-        3. "classifier-free": classifier-free guidance sampling by conditional DPMs.
-            The input `model` has the following format:
-            ``
-                model(x, t_input, cond, **model_kwargs) -> noise | x_start | v | score
-            `` 
-            And if cond == `unconditional_condition`, the model output is the unconditional DPM output.
-
-            [4] Ho, Jonathan, and Tim Salimans. "Classifier-free diffusion guidance."
-                arXiv preprint arXiv:2207.12598 (2022).
-        
-
-    The `t_input` is the time label of the model, which may be discrete-time labels (i.e. 0 to 999)
-    or continuous-time labels (i.e. epsilon to T).
-
-    We wrap the model function to accept only `x` and `t_continuous` as inputs, and outputs the predicted noise:
-    ``
-        def model_fn(x, t_continuous) -> noise:
-            t_input = get_model_input_time(t_continuous)
-            return noise_pred(model, x, t_input, **model_kwargs)         
-    ``
-    where `t_continuous` is the continuous time labels (i.e. epsilon to T). And we use `model_fn` for DPM-Solver.
-
-    ===============================================================
-
-    Args:
-        model: A diffusion model with the corresponding format described above.
-        noise_schedule: A noise schedule object, such as NoiseScheduleVP.
-        model_type: A `str`. The parameterization type of the diffusion model.
-                    "noise" or "x_start" or "v" or "score".
-        model_kwargs: A `dict`. A dict for the other inputs of the model function.
-        guidance_type: A `str`. The type of the guidance for sampling.
-                    "uncond" or "classifier" or "classifier-free".
-        condition: A pytorch tensor. The condition for the guided sampling.
-                    Only used for "classifier" or "classifier-free" guidance type.
-        unconditional_condition: A pytorch tensor. The condition for the unconditional sampling.
-                    Only used for "classifier-free" guidance type.
-        guidance_scale: A `float`. The scale for the guided sampling.
-        classifier_fn: A classifier function. Only used for the classifier guidance.
-        classifier_kwargs: A `dict`. A dict for the other inputs of the classifier function.
-    Returns:
-        A noise prediction model that accepts the noised data and the continuous time as the inputs.
-    """
 
     def get_model_input_time(t_continuous):
-        """
-        Convert the continuous-time `t_continuous` (in [epsilon, T]) to the model input time.
-        For discrete-time DPMs, we convert `t_continuous` in [1 / N, 1] to `t_input` in [0, 1000 * (N - 1) / N].
-        For continuous-time DPMs, we just use `t_continuous`.
-        """
         if noise_schedule.schedule == 'discrete':
             return (t_continuous - 1. / noise_schedule.total_N) * 1000.
         else:
             return t_continuous
 
-    def noise_pred_fn(x, t_continuous, cond=None):
-        t_input = get_model_input_time(t_continuous)
-        if cond is None:
-            output = model(x, t_input, **model_kwargs)
-        else:
-            output = model(x, t_input, cond, **model_kwargs)
+    def noise_pred_from_output(x_like, t_continuous_like, output_like):
+        """model output을 이미 갖고 있을 때 noise를 계산합니다(추가 모델 호출 없음)."""
         if model_type == "noise":
-            return output
+            return output_like
         elif model_type == "x_start":
-            alpha_t, sigma_t = noise_schedule.marginal_alpha(
-                t_continuous), noise_schedule.marginal_std(t_continuous)
-            return (x - expand_dims(alpha_t, x.dim()) * output) / expand_dims(
-                sigma_t, x.dim())
+            alpha_t = noise_schedule.marginal_alpha(t_continuous_like)
+            sigma_t = noise_schedule.marginal_std(t_continuous_like)
+            return (x_like - expand_dims(alpha_t, x_like.dim()) *
+                    output_like) / expand_dims(sigma_t, x_like.dim())
         elif model_type == "v":
-            alpha_t, sigma_t = noise_schedule.marginal_alpha(
-                t_continuous), noise_schedule.marginal_std(t_continuous)
-            return expand_dims(alpha_t, x.dim()) * output + expand_dims(
-                sigma_t, x.dim()) * x
+            alpha_t = noise_schedule.marginal_alpha(t_continuous_like)
+            sigma_t = noise_schedule.marginal_std(t_continuous_like)
+            return expand_dims(alpha_t, x_like.dim(
+            )) * output_like + expand_dims(sigma_t, x_like.dim()) * x_like
         elif model_type == "score":
-            sigma_t = noise_schedule.marginal_std(t_continuous)
-            return -expand_dims(sigma_t, x.dim()) * output
-
-    def cond_grad_fn(x, t_input):
-        """
-        Compute the gradient of the classifier, i.e. nabla_{x} log p_t(cond | x_t).
-
-        안전장치
-        - 바깥이 autocast(bf16) 컨텍스트여도, classifier_fn 계산 구간만 FP32로 고정합니다.
-        - 바깥이 torch.no_grad()/inference_mode 여도, 여기서는 미분이 가능하도록 다시 켭니다.
-        - 출력이 x에 대해 grad를 못 가지면(조용한 무력화) 즉시 에러로 잡습니다.
-        """
-        device_type: str = "cuda" if x.is_cuda else "cpu"
-
-        with torch.inference_mode(False), torch.enable_grad():
-            x_in = x.clone().detach().requires_grad_(True)
-
-            if not x_in.requires_grad:
-                raise RuntimeError("cond_grad_fn: x_in does not require grad.")
-
-            # ✅ classifier_fn 계산 구간만 autocast OFF로 고정 (bf16 노출 차단)
-            with torch.autocast(device_type=device_type, enabled=False):
-                log_prob = classifier_fn(x_in, t_input, condition,
-                                         **classifier_kwargs)
-
-                if not isinstance(log_prob, torch.Tensor):
-                    raise TypeError(
-                        f"classifier_fn must return torch.Tensor, got {type(log_prob)}"
-                    )
-                # ✅ no_grad/inference_mode/연결 끊김으로 guidance가 조용히 무력화되는 걸 방지
-                if not log_prob.requires_grad:
-                    raise RuntimeError(
-                        "classifier_fn output does not require grad w.r.t x. "
-                        "guidance가 no_grad/inference_mode 영향으로 조용히 꺼졌거나, "
-                        "classifier_fn 내부에서 x와의 연결이 끊겼을 수 있습니다.")
-
-                log_prob_sum = log_prob.float().sum()
-
-            grad = torch.autograd.grad(log_prob_sum,
-                                       x_in,
-                                       retain_graph=False,
-                                       create_graph=False)[0]
-            if grad is None:
-                raise RuntimeError("cond_grad_fn: grad is None.")
-            return grad.detach()
+            sigma_t = noise_schedule.marginal_std(t_continuous_like)
+            return -expand_dims(sigma_t, x_like.dim()) * output_like
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
 
     def model_fn(x, t_continuous):
-        """
-        The noise predicition model function that is used for DPM-Solver.
-        """
         if guidance_type == "uncond":
-            return noise_pred_fn(x, t_continuous)
+            # 기존 동작 유지
+            t_input = get_model_input_time(t_continuous)
+            output = model(x, t_input, **model_kwargs)
+            return noise_pred_from_output(x, t_continuous, output)
+
         elif guidance_type == "classifier":
             assert classifier_fn is not None
+
+            device_type = "cuda" if x.is_cuda else "cpu"
             t_input = get_model_input_time(t_continuous)
-            cond_grad = cond_grad_fn(x, t_input)
+
+            # classifier guidance는 ∂score/∂x가 필요하므로, no_grad 밖에서 수행
+            with torch.inference_mode(False), torch.enable_grad():
+                x_in = x.clone().detach().requires_grad_(True)
+
+                with torch.autocast(device_type=device_type, enabled=False):
+                    # (1) 모델 1회 호출
+                    # - side-effect로 model.diffusion_sequence_flat(=x0_pred)이 채워진다고 가정
+                    if condition is None:
+                        output = model(x_in, t_input, **model_kwargs)
+                    else:
+                        output = model(x_in, t_input, condition, **model_kwargs)
+
+                    # (2) 같은 output으로 noise_pred 계산 (추가 모델 호출 없음)
+                    noise = noise_pred_from_output(x_in, t_continuous, output)
+
+                    # (3) x0_pred 확보(우선 model에 저장된 값 사용)
+                    x0_pred = getattr(model, "diffusion_sequence_flat", None)
+                    if not isinstance(x0_pred, torch.Tensor):
+                        # 혹시 model이 x0를 저장하지 않는 타입이면, 최소한의 fallback으로 직접 구성
+                        if model_type == "x_start":
+                            x0_pred = output
+                        elif model_type == "v":
+                            alpha_t = noise_schedule.marginal_alpha(
+                                t_continuous)
+                            sigma_t = noise_schedule.marginal_std(t_continuous)
+                            x0_pred = expand_dims(
+                                alpha_t, x_in.dim()) * x_in - expand_dims(
+                                    sigma_t, x_in.dim()) * output
+                        elif model_type == "noise":
+                            alpha_t = noise_schedule.marginal_alpha(
+                                t_continuous)
+                            sigma_t = noise_schedule.marginal_std(t_continuous)
+                            alpha_safe = torch.clamp(alpha_t, min=1e-6)
+                            x0_pred = (x_in - expand_dims(sigma_t, x_in.dim()) *
+                                       output) / expand_dims(
+                                           alpha_safe, x_in.dim())
+                        elif model_type == "score":
+                            alpha_t = noise_schedule.marginal_alpha(
+                                t_continuous)
+                            sigma_t = noise_schedule.marginal_std(t_continuous)
+                            alpha_safe = torch.clamp(alpha_t, min=1e-6)
+                            x0_pred = (
+                                x_in +
+                                expand_dims(sigma_t * sigma_t, x_in.dim()) *
+                                output) / expand_dims(alpha_safe, x_in.dim())
+                        else:
+                            raise ValueError(
+                                f"Unknown model_type: {model_type}")
+
+                    # (4) classifier_fn에 x0_pred를 넘겨서 GuidanceWrapper가 재사용하게 함
+                    local_classifier_kwargs = dict(classifier_kwargs)
+                    local_classifier_kwargs["x0_pred"] = x0_pred
+
+                    log_prob = classifier_fn(x_in, t_input, condition,
+                                             **local_classifier_kwargs)
+                    if not isinstance(log_prob, torch.Tensor):
+                        raise TypeError(
+                            f"classifier_fn must return torch.Tensor, got {type(log_prob)}"
+                        )
+                    if not log_prob.requires_grad:
+                        raise RuntimeError(
+                            "classifier_fn output does not require grad w.r.t x. "
+                            "guidance가 no_grad/inference_mode 영향으로 꺼졌거나, "
+                            "classifier_fn 내부에서 x와의 연결이 끊겼을 수 있습니다.")
+
+                    log_prob_sum = log_prob.float().sum()
+
+                grad = torch.autograd.grad(
+                    outputs=log_prob_sum,
+                    inputs=x_in,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                if grad is None:
+                    raise RuntimeError("classifier guidance grad is None.")
+                grad = grad.detach()
+
             sigma_t = noise_schedule.marginal_std(t_continuous)
-            noise = noise_pred_fn(x, t_continuous)
-            return noise - guidance_scale * expand_dims(sigma_t,
-                                                        x.dim()) * cond_grad
+            guided = noise.detach() - guidance_scale * expand_dims(
+                sigma_t, x.dim()) * grad
+            return guided.detach()
+
         elif guidance_type == "classifier-free":
+            # 기존 동작 유지(모델 호출 최적화는 범위를 늘리므로 여기서는 건드리지 않음)
+            t_input = get_model_input_time(t_continuous)
             if guidance_scale == 1. or unconditional_condition is None:
-                return noise_pred_fn(x, t_continuous, cond=condition)
+                output = model(x, t_input, condition, **model_kwargs)
+                return noise_pred_from_output(x, t_continuous, output)
             else:
-                # x_in = torch.cat([x] * 2)
-                # t_in = torch.cat([t_continuous] * 2)
-                # c_in = torch.cat([unconditional_condition, condition])
-                # noise_uncond, noise = noise_pred_fn(x_in, t_in, cond=c_in).chunk(2)
-                noise_uncond = noise_pred_fn(x,
-                                             t_continuous,
-                                             cond=unconditional_condition)
-                noise = noise_pred_fn(x, t_continuous, cond=condition)
-                return noise_uncond + guidance_scale * (noise - noise_uncond)
+                noise_uncond_out = model(x, t_input, unconditional_condition,
+                                         **model_kwargs)
+                noise_cond_out = model(x, t_input, condition, **model_kwargs)
+
+                noise_uncond = noise_pred_from_output(x, t_continuous,
+                                                      noise_uncond_out)
+                noise_cond = noise_pred_from_output(x, t_continuous,
+                                                    noise_cond_out)
+                return noise_uncond + guidance_scale * (noise_cond -
+                                                        noise_uncond)
+
+        else:
+            raise ValueError(f"Unknown guidance_type: {guidance_type}")
 
     assert model_type in ["noise", "x_start", "v", "score"]
     assert guidance_type in ["uncond", "classifier", "classifier-free"]
