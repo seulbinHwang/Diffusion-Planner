@@ -23,8 +23,6 @@ class GuidanceWrapper:
 
     def _get_x0_pred_flat(
         self,
-        x_in: torch.Tensor,  # (B,P,F)
-        t_input: torch.Tensor,  # (B,) 또는 (B,T)도 가능(Decoder가 넘기면)
         *,
         kwargs: Dict[str, Any],
     ) -> torch.Tensor:
@@ -35,8 +33,6 @@ class GuidanceWrapper:
         2) 없으면 model(x_in, diffusion_time, ...)을 다시 호출해서 model.diffusion_sequence_flat을 사용
 
         Args:
-            x_in (torch.Tensor): 현재 샘플(flat). shape: (B,P,F)
-            t_input (torch.Tensor): 대표 시간. shape: (B,)
             kwargs (Dict[str,Any]): model/model_condition/config 등이 들어 있음
 
         Returns:
@@ -45,45 +41,8 @@ class GuidanceWrapper:
         x0_pred = kwargs.get("x0_pred", None)
         if isinstance(x0_pred, torch.Tensor):
             return x0_pred
+        raise RuntimeError("GuidanceWrapper: kwargs에 x0_pred가 없습니다. amortized 1-step이 아닌데 model을 다시 호출할 수 없습니다.")
 
-        model = kwargs.get("model", None)
-        model_condition = kwargs.get("model_condition", None)
-        if model is None or not isinstance(model_condition, dict):
-            raise ValueError(
-                "GuidanceWrapper: x0_pred가 없는데 model/model_condition을 찾을 수 없습니다."
-            )
-
-        # ✅ amortized 1-step에서는 Decoder가 (B,T)인 t_tau를 넘겨줄 수 있음
-        diffusion_time_for_guidance = kwargs.get("diffusion_time_for_guidance", None)
-        if isinstance(diffusion_time_for_guidance, torch.Tensor):
-            diffusion_time = diffusion_time_for_guidance
-        else:
-            diffusion_time = t_input
-
-        diffusion_time = diffusion_time.to(device=x_in.device, dtype=torch.float32)
-
-        # (B,T) 시간을 쓰면, DiT 내부 feasible 쪽에서 (B,) low_t_mask가 필요할 수 있어 안전하게 제공
-        low_t_mask = kwargs.get("low_t_mask_for_guidance", None)
-        if low_t_mask is None and diffusion_time.dim() == 2:
-            B = int(x_in.shape[0])
-            low_t_mask = torch.ones((B,), device=x_in.device, dtype=torch.bool)
-
-        device_type = "cuda" if x_in.is_cuda else "cpu"
-        with torch.autocast(
-                device_type=device_type,
-                dtype=torch.bfloat16,
-                enabled=(device_type == "cuda"),
-        ):
-            _ = model(
-                x_in,
-                diffusion_time,
-                **model_condition,
-                low_t_mask=low_t_mask,
-            )
-        x0_new = getattr(model, "diffusion_sequence_flat", None)
-        if not isinstance(x0_new, torch.Tensor):
-            raise RuntimeError("GuidanceWrapper: model.diffusion_sequence_flat을 얻지 못했습니다.")
-        return x0_new
 
     def __call__(
         self,
@@ -104,14 +63,13 @@ class GuidanceWrapper:
         Returns:
             torch.Tensor: (B,) 점수 텐서
         """
-        print("GuidanceWrapper:")
         if x_in.dim() != 3:
             raise ValueError(f"GuidanceWrapper: x_in must be (B,P,F). got {tuple(x_in.shape)}")
         if t_input.dim() != 1:
             raise ValueError(f"GuidanceWrapper: t_input must be (B,). got {tuple(t_input.shape)}")
 
         # ✅ 핵심: 안전 점수는 x0_pred로 계산
-        x0_pred_flat = self._get_x0_pred_flat(x_in=x_in, t_input=t_input, kwargs=kwargs)
+        x0_pred_flat = self._get_x0_pred_flat(kwargs=kwargs)
 
         # safety_guidance_fn이 kwargs["x0_pred"]를 우선 사용하도록 같이 넣어둠
         local_kwargs = dict(kwargs)
