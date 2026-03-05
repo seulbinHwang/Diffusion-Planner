@@ -1576,7 +1576,7 @@ class Decoder(nn.Module):
                     # (B, (1+)Pnn, 4)
                 )
                 diffusion_future_sequence = diffusion_cur_future_sequence[:, :, -(
-                    self.config.future_len):, :]
+                    self.config.future_len):, :] # (B, (1+)Pnn, T, 4)
                 # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
                 self._set_amortized_buffer_from_sequence(
                     diffusion_future_sequence=diffusion_future_sequence,

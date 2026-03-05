@@ -348,12 +348,13 @@ def model_wrapper(
                     raise RuntimeError(
                         "classifier_fn output does not require grad w.r.t x. "
                         "guidance가 no_grad/inference_mode 영향으로 조용히 꺼졌거나, "
-                        "classifier_fn 내부에서 x와의 연결이 끊겼을 수 있습니다."
-                    )
+                        "classifier_fn 내부에서 x와의 연결이 끊겼을 수 있습니다.")
 
                 log_prob_sum = log_prob.float().sum()
 
-            grad = torch.autograd.grad(log_prob_sum, x_in, retain_graph=False,
+            grad = torch.autograd.grad(log_prob_sum,
+                                       x_in,
+                                       retain_graph=False,
                                        create_graph=False)[0]
             if grad is None:
                 raise RuntimeError("cond_grad_fn: grad is None.")
