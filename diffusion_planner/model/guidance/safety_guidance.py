@@ -431,12 +431,12 @@ def _compute_agent_collision_energy(
 
 
 def _compute_road_edge_energy(
-    xy: torch.Tensor,            # (B,P,K,2)
+    xy: torch.Tensor,            # (B,P,K,2)  "비정규화된" 좌표
     xy_valid: torch.Tensor,      # (B,P,K) bool
     is_vehicle: torch.Tensor,    # (B,P) bool
     *,
-    road_edge: Optional[torch.Tensor],          # (B,Ne,S,2) or None
-    road_edge_is_valid: Optional[torch.Tensor], # (B,Ne) or None
+    road_edge: Optional[torch.Tensor],          # (B,Ne,S,2)  "비정규화된" 좌표
+    road_edge_is_valid: Optional[torch.Tensor], # (B,Ne) or (B,Ne,S) or (B,Ne,S-1) or None
     w_time: torch.Tensor,        # (K,)
     r_veh: float,
     margin_edge: float,
@@ -445,26 +445,27 @@ def _compute_road_edge_energy(
 ) -> torch.Tensor:
     """(차량만) road_edge에 가까워지는 정도를 벌점으로 주는 E_edge를 계산합니다.
 
-    안전장치(핵심):
-        - road_edge를 xy와 같은 device로 맞춥니다.
-        - 거리 계산 전에 무효 위치는 (0,0)으로 강제합니다.
-        - NaN/Inf도 (0,0)으로 강제합니다.
+    전제(중요)
+    - xy와 road_edge는 반드시 "같은 단위(비정규화된 단위)"여야 합니다.
+      즉, 둘 다 원래 좌표 단위로 맞춘 뒤에 거리 계산을 합니다.
 
-    성능 개선(핵심):
-        - K스텝을 for문으로 돌지 않고, (B,P,K)을 한 번에 처리합니다.
-        - 선분(M)이 너무 많을 때는 내부에서 몇 덩어리로 나눠 계산합니다(결과 동일).
+    Args:
+        xy (torch.Tensor): (B,P,K,2)
+        road_edge (torch.Tensor): (B,Ne,S,2)
 
     Returns:
-        torch.Tensor: shape (B,), dtype=float32
+        torch.Tensor: (B,) float32
     """
     B, P, K, _ = xy.shape
     if road_edge is None or int(getattr(road_edge, "numel", lambda: 0)()) == 0:
         return xy.new_zeros((B,), dtype=torch.float32)
 
-    if not isinstance(road_edge, torch.Tensor) or road_edge.dim() != 4 or int(road_edge.shape[-1]) != 2:
+    if (not isinstance(road_edge, torch.Tensor)) or road_edge.dim() != 4 or int(road_edge.shape[-1]) != 2:
         return xy.new_zeros((B,), dtype=torch.float32)
 
     device = xy.device
+
+    # road_edge: float32 + NaN/Inf -> 0
     road_edge_f32 = road_edge.to(device=device, dtype=torch.float32)  # (B,Ne,S,2)
     road_edge_f32 = torch.where(torch.isfinite(road_edge_f32), road_edge_f32, torch.zeros_like(road_edge_f32))
 
@@ -472,6 +473,62 @@ def _compute_road_edge_energy(
     if B2 != B or int(Ne) <= 0 or int(S) <= 1:
         return xy.new_zeros((B,), dtype=torch.float32)
 
+    # ---------- seg valid 만들기 ----------
+    def _build_seg_valid(
+        valid: Optional[torch.Tensor],
+        *,
+        B: int,
+        Ne: int,
+        S: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """road_edge_is_valid에서 선분(valid) 마스크를 만듭니다.
+
+        Returns:
+            torch.Tensor: (B, Ne*(S-1)) bool
+        """
+        seg_len = int(S - 1)
+        if seg_len <= 0:
+            return torch.zeros((B, 0), device=device, dtype=torch.bool)
+
+        if valid is None:
+            seg = torch.ones((B, Ne, seg_len), device=device, dtype=torch.bool)  # (B,Ne,S-1)
+            return seg.reshape(B, Ne * seg_len)
+
+        v = _to_bool_mask(valid).to(device=device)  # bool
+        if v.dim() == 2:
+            if int(v.shape[0]) != B or int(v.shape[1]) != Ne:
+                raise ValueError(
+                    "road_edge_is_valid shape mismatch (2D). "
+                    f"expected={(B, Ne)}, got={tuple(v.shape)}"
+                )
+            seg = v.unsqueeze(-1).expand(B, Ne, seg_len)  # (B,Ne,S-1)
+            return seg.reshape(B, Ne * seg_len)
+
+        if v.dim() == 3:
+            if int(v.shape[0]) != B or int(v.shape[1]) != Ne:
+                raise ValueError(
+                    "road_edge_is_valid shape mismatch (3D). "
+                    f"expected B={B}, Ne={Ne}, got={tuple(v.shape)}"
+                )
+            if int(v.shape[2]) == int(S):
+                # 점 단위 valid -> 선분 valid
+                seg = v[:, :, :-1] & v[:, :, 1:]  # (B,Ne,S-1)
+                return seg.reshape(B, Ne * seg_len)
+            if int(v.shape[2]) == int(S - 1):
+                # 이미 선분 단위 valid
+                return v.reshape(B, Ne * seg_len)
+            raise ValueError(
+                "road_edge_is_valid last dim must be S or (S-1). "
+                f"S={S}, got last_dim={int(v.shape[2])}"
+            )
+
+        raise ValueError(
+            "road_edge_is_valid must be 2D or 3D (or None). "
+            f"got dim={int(v.dim())}"
+        )
+
+    # 선분 끝점들
     p0 = road_edge_f32[:, :, :-1, :]                                  # (B,Ne,S-1,2)
     p1 = road_edge_f32[:, :, 1:, :]                                   # (B,Ne,S-1,2)
 
@@ -479,14 +536,13 @@ def _compute_road_edge_energy(
     p0f = p0.reshape(B, M, 2)                                          # (B,M,2)
     p1f = p1.reshape(B, M, 2)                                          # (B,M,2)
 
-    if road_edge_is_valid is None:
-        seg_edge_valid = torch.ones((B, M), device=device, dtype=torch.bool)  # (B,M)
-    else:
-        if isinstance(road_edge_is_valid, torch.Tensor):
-            rev = _to_bool_mask(road_edge_is_valid).to(device=device)        # (B,Ne)
-            seg_edge_valid = rev.unsqueeze(-1).expand(B, Ne, S - 1).reshape(B, M)  # (B,M)
-        else:
-            seg_edge_valid = torch.ones((B, M), device=device, dtype=torch.bool)    # (B,M)
+    seg_edge_valid = _build_seg_valid(
+        road_edge_is_valid,
+        B=int(B),
+        Ne=int(Ne),
+        S=int(S),
+        device=device,
+    )                                                                  # (B,M)
 
     is_vehicle_b = _to_bool_mask(is_vehicle).to(device=device)         # (B,P)
     if not bool(is_vehicle_b.any()):
@@ -520,6 +576,51 @@ def _compute_road_edge_energy(
     E = (E_k * w).sum(dim=1)                                           # (B,)
     return E
 
+def _inverse_road_edge_to_unnorm(
+    *,
+    road_edge_norm: torch.Tensor,                     # (B, Ne, S, 2)
+    road_edge_is_valid: Optional[torch.Tensor],       # (B,Ne) or (B,Ne,S) or (B,Ne,S-1)
+    observation_normalizer: Any,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """정규화된 road_edge를 원래 단위(비정규화)로 되돌립니다.
+
+    Args:
+        road_edge_norm (torch.Tensor):
+            road_edge 점 좌표(정규화된 값).
+            shape: (B, Ne, S, 2)
+        road_edge_is_valid (Optional[torch.Tensor]):
+            유효 마스크.
+            - shape: (B, Ne)      : 폴리라인 단위 유효
+            - shape: (B, Ne, S)   : 점 단위 유효
+            - shape: (B, Ne, S-1) : 선분 단위 유효
+        observation_normalizer (Any):
+            observation_normalizer.inverse(dict)를 제공하는 객체.
+
+    Returns:
+        Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            - road_edge_unnorm: 비정규화된 road_edge.
+              shape: (B, Ne, S, 2)
+            - road_edge_is_valid_out: 입력과 같은 의미의 valid(단, device는 road_edge_unnorm에 맞춤)
+              shape: 입력과 동일
+    """
+    if not hasattr(observation_normalizer, "inverse"):
+        raise TypeError("observation_normalizer는 inverse(...) 메서드가 있어야 합니다.")
+
+    pack: Dict[str, Any] = {"road_edge": road_edge_norm}
+    if isinstance(road_edge_is_valid, torch.Tensor):
+        pack["road_edge_is_valid"] = road_edge_is_valid
+
+    unnorm = observation_normalizer.inverse(pack)
+    road_edge_unnorm = unnorm.get("road_edge", None)
+    if not isinstance(road_edge_unnorm, torch.Tensor):
+        raise RuntimeError("observation_normalizer.inverse(...) 결과에 'road_edge'가 없습니다.")
+
+    if isinstance(road_edge_is_valid, torch.Tensor):
+        road_edge_is_valid_out = road_edge_is_valid.to(device=road_edge_unnorm.device)
+    else:
+        road_edge_is_valid_out = None
+
+    return road_edge_unnorm, road_edge_is_valid_out
 
 def safety_guidance_fn(
     x_in: torch.Tensor,   # 여기서는 x0_flat을 받는 규약
@@ -533,7 +634,6 @@ def safety_guidance_fn(
         - g(t)==0이면 즉시 0 반환(연결은 유지해서 grad가 0으로 나오게).
         - road_edge / road_edge_is_valid를 x0와 같은 device로 이동.
     """
-    print("safety_guidance_fn")
     x0_from_kwargs = kwargs.get("x0_pred", None)
     if isinstance(x0_from_kwargs, torch.Tensor):
         x0_use = x0_from_kwargs
@@ -617,19 +717,36 @@ def safety_guidance_fn(
     if not isinstance(inputs, dict):
         inputs = {}
 
-    road_edge = inputs.get("road_edge", None)
-    if isinstance(road_edge, torch.Tensor):
-        road_edge = road_edge.to(device=device)
-        print("road_edge.shape: ", road_edge.shape)
-    else:
-        road_edge = None
-        raise ValueError("road_edge must be a torch.Tensor")
+    observation_normalizer = kwargs.get("observation_normalizer", None)
+    if observation_normalizer is None:
+        raise ValueError(
+            "safety_guidance_fn: kwargs['observation_normalizer']가 없습니다.")
 
+    # -------------------------
+    # inputs + road_edge: 정규화 -> 비정규화로 되돌려서 사용
+    # -------------------------
+    inputs = kwargs.get("inputs", {})
+    if not isinstance(inputs, dict):
+        inputs = {}
+
+    road_edge_norm = inputs.get("road_edge", None)
     road_edge_is_valid = inputs.get("road_edge_is_valid", None)
-    if isinstance(road_edge_is_valid, torch.Tensor):
-        road_edge_is_valid = road_edge_is_valid.to(device=device)
+
+    if isinstance(road_edge_norm, torch.Tensor):
+        road_edge_norm = road_edge_norm.to(device=device)
+        if isinstance(road_edge_is_valid, torch.Tensor):
+            road_edge_is_valid = road_edge_is_valid.to(device=device)
+
+        # ✅ 핵심: road_edge를 observation_normalizer 기준으로 비정규화
+        road_edge_unnorm, road_edge_is_valid = _inverse_road_edge_to_unnorm(
+            road_edge_norm=road_edge_norm,  # (B,Ne,S,2)
+            road_edge_is_valid=road_edge_is_valid,  # (B,Ne) or ...
+            observation_normalizer=observation_normalizer,
+        )
     else:
+        road_edge_unnorm = None
         road_edge_is_valid = None
+
 
     # -------------------------
     # valid mask
@@ -690,7 +807,7 @@ def safety_guidance_fn(
         xy=xy,
         xy_valid=xy_valid,
         is_vehicle=is_vehicle,
-        road_edge=road_edge,
+        road_edge=road_edge_unnorm,
         road_edge_is_valid=road_edge_is_valid,
         w_time=w_time,
         r_veh=r_veh,

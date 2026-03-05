@@ -113,7 +113,7 @@ FORCE_REBUILD=0
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
     --name "use_npc_data_augment_true_use_body_vel_false" \
-    --load_name "use_npc_data_augment_true_use_body_vel_false" \
+    --load_name "use_npc_data_augment_true_use_body_vel_false_test" \
     --resume_wandb_model_name latest \
     --resume_model_only False \
     --batch_size 1536 \
@@ -124,7 +124,7 @@ FORCE_REBUILD=0
     --profile_feasible False \
     --use_feasible True \
     --use_feasible_dl False \
-    --use_feasible_filter False \
+    --use_feasible_filter True \
     --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \

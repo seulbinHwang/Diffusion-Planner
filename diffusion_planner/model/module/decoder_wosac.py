@@ -299,7 +299,10 @@ class Decoder(nn.Module):
         # self._guidance_fn = config.guidance_fn
         # = <diffusion_planner/model/guidance/guidance_wrapper.py> 의 GuidanceWrapper 인스턴스가 들어옴
         self._guidance_fn = getattr(config, "guidance_fn", None)
-        self._guidance_fn = GuidanceWrapper()
+        if self.config.use_guidance:
+            self._guidance_fn = GuidanceWrapper()
+        else:
+            self._guidance_fn = None
         self._amortized_buffer = None  # (B, 1+Pnn, T, 4 or 3)
         # ✅ (추가) z를 만들 때 사용한 표준정규 노이즈(eps) 버퍼
         # shape: (B, 1+Pnn, T, 4 or 3)

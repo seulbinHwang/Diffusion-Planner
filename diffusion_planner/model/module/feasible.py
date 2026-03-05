@@ -5695,7 +5695,11 @@ class FeasibleProjector(nn.Module):
                                       args.w_int_min) * (p / args.p_sat)
         else:
             w_int = args.w_int_max
-        return args.w_dir, w_int, args.w_const
+        if p < args.p_const_sat:
+            w_const = 0. + (args.w_const) * (p / args.p_const_sat)
+        else:
+            w_const = args.w_const
+        return args.w_dir, w_int, w_const
 
     # ================================================================
     # [추가] (B,Pnn,point_len, C) 형태를 멀티 채널 SG에 넘겨주는 헬퍼
