@@ -1227,6 +1227,196 @@ class Decoder(nn.Module):
         # 다시 flatten: (B, Pnn, F)
         return xt_sequence_flattened
 
+
+    def _expand_time_to_batch_for_solver(
+        self,
+        t_in: torch.Tensor,
+        batch_size: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """DPM-Solver가 주는 t(스칼라/1개/배치)를 (B,) float32로 통일합니다.
+
+        Args:
+            t_in (torch.Tensor): shape: () 또는 (1,) 또는 (B,) 등
+            batch_size (int): B
+            device (torch.device): 결과 device
+
+        Returns:
+            torch.Tensor: (B,) dtype=float32
+        """
+        if not isinstance(t_in, torch.Tensor):
+            t = torch.tensor(float(t_in), device=device, dtype=torch.float32)
+        else:
+            t = t_in.to(device=device, dtype=torch.float32)
+
+        if t.dim() == 0:
+            return t.view(1).expand(int(batch_size)).contiguous()
+        if t.dim() == 1:
+            if int(t.numel()) == 1:
+                return t.view(1).expand(int(batch_size)).contiguous()
+            if int(t.numel()) == int(batch_size):
+                return t.view(int(batch_size))
+        # 예외 케이스: 첫 값만 대표값으로 사용
+        t0 = t.reshape(-1)[0]
+        return t0.view(1).expand(int(batch_size)).contiguous()
+
+    def _get_target_current_control_norm_for_feasible(
+        self,
+        target_seq_past: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """pose_based=False + use_past_dit_input=True에서 k=0 제약에 쓸 '마지막 과거 구간 control'을 준비합니다.
+
+        Returns:
+            Optional[torch.Tensor]:
+                (B, (1+)Pnn, 3) 또는 None
+        """
+        if bool(getattr(self.config, "pose_based", True)):
+            return None
+        if not bool(getattr(self.config, "use_past_dit_input", False)):
+            return None
+        if not isinstance(target_seq_past, torch.Tensor):
+            return None
+        if target_seq_past.dim() != 4 or int(target_seq_past.shape[-1]) != 3:
+            return None
+        if int(target_seq_past.shape[2]) <= 0:
+            return None
+        # 마지막 과거 구간 control: (B, (1+)Pnn, 3)
+        return target_seq_past[:, :, -1, :]
+
+    def _overwrite_x0_future_from_replacement(
+        self,
+        x0_flat: torch.Tensor,              # (B,P,F)
+        replacement_future: torch.Tensor,   # (B,P,T,D)
+        *,
+        last_dim: int,
+    ) -> torch.Tensor:
+        """x0_flat의 '미래 구간'만 replacement_future로 교체합니다.
+
+        Args:
+            x0_flat (torch.Tensor): (B,P,F)
+            replacement_future (torch.Tensor): (B,P,future_len,D)
+            last_dim (int): pose_based면 4, 아니면 3
+
+        Returns:
+            torch.Tensor: (B,P,F)  (x0_flat의 미래 구간만 교체된 결과)
+        """
+        if x0_flat.dim() != 3:
+            raise ValueError(f"x0_flat must be (B,P,F). got {tuple(x0_flat.shape)}")
+        if replacement_future.dim() != 4:
+            raise ValueError(
+                f"replacement_future must be (B,P,T,D). got {tuple(replacement_future.shape)}"
+            )
+        if int(replacement_future.shape[-1]) != int(last_dim):
+            raise ValueError("replacement_future last dim mismatch. "
+                             f"expected={int(last_dim)}, got={int(replacement_future.shape[-1])}")
+
+        B, P, F = x0_flat.shape
+        T = int(replacement_future.shape[2])
+
+        if F % int(last_dim) != 0:
+            raise ValueError(f"x0_flat last dim must be multiple of {int(last_dim)}. F={F}")
+
+        T_any = int(F // int(last_dim))
+        if T_any < T:
+            raise ValueError(f"x0_flat time length is shorter than replacement. T_any={T_any}, T={T}")
+
+        start = int(T_any - T)  # 마지막 future_len 구간이 미래
+        x_seq = x0_flat.reshape(int(B), int(P), int(T_any), int(last_dim))
+        x_seq[:, :, start:start + T, :] = replacement_future.to(device=x_seq.device, dtype=x_seq.dtype)
+        return x_seq.reshape(int(B), int(P), int(F))
+
+    def _build_inference_correcting_x0_fn(
+        self,
+        *,
+        target_agents_past: torch.Tensor,                  # (B,(1+)Pnn,time_len,11)
+        target_seq_past: Optional[torch.Tensor],           # pose_based: (B,(1+)Pnn,time_len,4) / else (B,(1+)Pnn,past_len,3)
+        target_past_cur_future_valid: torch.Tensor,        # (B,(1+)Pnn,time_len+future_len)
+        correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor],
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """DPM-Solver의 correcting_x0_fn을 구성합니다.
+
+        목표:
+            - solver가 만든 'guidance 반영 x0'를 Feasible로 보정한 뒤,
+              그 결과가 solver update/최종 출력에 그대로 쓰이게 합니다.
+            - 동시에, DiT.forward 내부 feasible은 skip_feasible로 끄므로
+              '한 번의 모델 평가에서 feasible이 2번 호출'되지 않습니다.
+
+        Returns:
+            Callable[[x0, t], x0_new]
+        """
+        pose_based = bool(getattr(self.config, "pose_based", True))
+        t_threshold = float(getattr(self.config, "feasible_learn_noise_thresh", 0.3))
+
+        # pose_based=False에서만 필요
+        target_current_control_norm = self._get_target_current_control_norm_for_feasible(
+            target_seq_past
+        )
+
+        def correcting_x0_fn(x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            # x0: (B,P,F)
+            if x0.dim() != 3:
+                raise ValueError(f"correcting_x0_fn: x0 must be (B,P,F). got {tuple(x0.shape)}")
+
+            B_now = int(x0.shape[0])
+            t_b = self._expand_time_to_batch_for_solver(
+                t_in=t,
+                batch_size=B_now,
+                device=x0.device,
+            )  # (B,) float32
+
+            # low_t_mask: (B,)  (threshold<=0이면 항상 켬)
+            if t_threshold <= 0.0:
+                low_t_mask = torch.ones((B_now,), device=x0.device, dtype=torch.bool)
+            else:
+                low_t_mask = (t_b <= float(t_threshold))
+
+            # -------------------------
+            # 1) (옵션) Feasible 적용
+            #   - pose_based=True : low_t_mask=False면 내부에서 빠르게 base로 처리(비싼 계산 없음)
+            #   - pose_based=False: 비용이 크므로 low_t_mask=True일 때만 실행(후반 step)
+            # -------------------------
+            x0_after = x0
+
+            if bool(getattr(self.config, "use_feasible", False)):
+                if pose_based or bool(low_t_mask.any().item()):
+                    # ✅ 여기서만 feasible 실행
+                    self.dit.do_feasible_projection(
+                        x=x0_after,                         # (B,P,F)
+                        low_t_mask=low_t_mask,              # (B,)
+                        diffusion_time=t_b,                 # (B,)
+                        target_agents_past=target_agents_past,
+                        target_past_cur_future_valid=target_past_cur_future_valid,
+                        target_current_control=target_current_control_norm,
+                    )
+
+                    if pose_based:
+                        integ_fut = getattr(self.dit.norm_dit_returns, "integrated_trajectory", None)
+                        if isinstance(integ_fut, torch.Tensor):
+                            # integ_fut: (B,P,future_len,4)
+                            x0_after = self._overwrite_x0_future_from_replacement(
+                                x0_flat=x0_after,
+                                replacement_future=integ_fut,
+                                last_dim=4,
+                            )
+                    else:
+                        ctrl_fut = getattr(self.dit.norm_dit_returns, "control_sequence", None)
+                        if isinstance(ctrl_fut, torch.Tensor):
+                            # ctrl_fut: (B,P,future_len,3)
+                            x0_after = self._overwrite_x0_future_from_replacement(
+                                x0_flat=x0_after,
+                                replacement_future=ctrl_fut,
+                                last_dim=3,
+                            )
+
+            # -------------------------
+            # 2) 마지막에 correcting_xt_fn으로 "과거/현재 고정 + invalid=0 + yaw 단위원" 정리
+            # -------------------------
+            x0_after = correcting_xt_fn(x0_after, t_b, 0)  # (B,P,F)
+            return x0_after
+
+        return correcting_x0_fn
+
     def _build_inference_correcting_xt_fn(
         self,
         batch_size: int,
@@ -1628,34 +1818,47 @@ class Decoder(nn.Module):
             pose_based = False
                 (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
             """
+            other_model_params: Dict[str, Any] = {
+                "target_agents_past": target_agents_past,
+                "target_past_cur_future_valid": target_past_cur_future_valid,
+                "cross_c": scene_encoding_token,
+                "cross_mask": scene_encoding_token_mask,
+            }
+
+            dpm_solver_params: Dict[str, Any] = {
+                "correcting_xt_fn": correcting_xt_fn,
+            }
+
+            # ✅ 핵심: use_feasible=True면
+            # - DiT.forward의 feasible은 끄고(skip_feasible=True)
+            # - correcting_x0_fn에서만 feasible을 1회 실행
+            if bool(getattr(self.config, "use_feasible", False)):
+                other_model_params = dict(other_model_params)
+                other_model_params["skip_feasible"] = True
+
+                dpm_solver_params[
+                    "correcting_x0_fn"] = self._build_inference_correcting_x0_fn(
+                    target_agents_past=target_agents_past,
+                    target_seq_past=target_seq_past,
+                    target_past_cur_future_valid=target_past_cur_future_valid,
+                    correcting_xt_fn=correcting_xt_fn,
+                )
+
             diffusion_sequence: torch.Tensor = dpm_sampler(
                 self.dit,
                 xT.float(),
                 diffusion_steps=diffusion_steps,
-                other_model_params={
-                    "target_agents_past":
-                        target_agents_past,
-                    "target_past_cur_future_valid":
-                        target_past_cur_future_valid,
-                    "cross_c":
-                        scene_encoding_token,
-                    "cross_mask":
-                        scene_encoding_token_mask,
-                },
-                dpm_solver_params={
-                    "correcting_xt_fn": correcting_xt_fn,
-                },
+                other_model_params=other_model_params,
+                dpm_solver_params=dpm_solver_params,
                 model_wrapper_params={
-                    "classifier_fn":
-                        self._guidance_fn,
-                    "classifier_kwargs":
-                        classifier_kwargs,
-                    "guidance_scale":
-                        self.config.guidance_scale,
-                    "guidance_type": ("classifier" if self._guidance_fn
-                                      is not None else "uncond"),
+                    "classifier_fn": self._guidance_fn,
+                    "classifier_kwargs": classifier_kwargs,
+                    "guidance_scale": self.config.guidance_scale,
+                    "guidance_type": (
+                        "classifier" if self._guidance_fn is not None else "uncond"),
                 },
             )
+
             if self.config.use_amortized_diffusion:
                 """ 2. WARM-UP step
                 1. diffusion_sequence 에 다시 noise를 준다.
@@ -1752,6 +1955,7 @@ class Decoder(nn.Module):
             cross_c=scene_encoding_token,
             cross_mask=scene_encoding_token_mask,
             low_t_mask=low_t_mask,
+            skip_feasible=True,  # ✅ 추가
         )
 
         # (2) denoise_to_zero 역할: DiT가 저장해둔 x0 후보(flat)를 가져온다.
@@ -1800,11 +2004,72 @@ class Decoder(nn.Module):
             x0_guided_flat = x0_base_flat + (guidance_scale *
                                              sigma2_over_alpha) * grad
 
-        # (5) correcting_xt_fn을 마지막에 1회 호출 (마스크/현재상태 주입/단위원 정리 포함)
+        # (4) guidance 반영된 x0
+        x0_guided_flat: torch.Tensor = x0_base_flat
+        guidance_scale: float = float(
+            getattr(self.config, "guidance_scale", 0.0))
+        if (self._guidance_fn is not None) and (guidance_scale != 0.0):
+            classifier_kwargs_for_guidance = dict(classifier_kwargs)
+            classifier_kwargs_for_guidance[
+                "diffusion_time_for_guidance"] = t_tau
+            classifier_kwargs_for_guidance[
+                "low_t_mask_for_guidance"] = low_t_mask
+
+            grad: torch.Tensor = self._compute_guidance_grad_wrt_x(
+                x_t_flat=xT_f32,
+                t_eff=t_eff_guidance,
+                classifier_kwargs=classifier_kwargs_for_guidance,
+            )
+
+            sigma2_over_alpha: torch.Tensor = self._compute_sigma2_over_alpha_for_guidance(
+                t_eff=t_eff,
+                reference_tensor_for_device=xT_f32,
+            )
+
+            x0_guided_flat = x0_base_flat + (
+                        guidance_scale * sigma2_over_alpha) * grad
+
+        # ✅ (4.5) guidance 후 x0에 feasible 적용 → x0_future를 교체
+        x0_after_feasible_flat: torch.Tensor = x0_guided_flat
+        if bool(getattr(self.config, "use_feasible", False)):
+            target_current_control_norm = self._get_target_current_control_norm_for_feasible(
+                target_seq_past
+            )
+
+            # amortized는 기존 의도대로 "항상 feasible 실행" (low_t_mask=ones 유지)
+            self.dit.do_feasible_projection(
+                x=x0_guided_flat,
+                low_t_mask=low_t_mask,
+                diffusion_time=t_eff,  # (B,)
+                target_agents_past=target_agents_past,
+                target_past_cur_future_valid=target_past_cur_future_valid,
+                target_current_control=target_current_control_norm,
+            )
+
+            if bool(getattr(self.config, "pose_based", True)):
+                integ_fut = getattr(self.dit.norm_dit_returns,
+                                    "integrated_trajectory", None)
+                if isinstance(integ_fut, torch.Tensor):
+                    x0_after_feasible_flat = self._overwrite_x0_future_from_replacement(
+                        x0_flat=x0_guided_flat,
+                        replacement_future=integ_fut,  # (B,P,T,4)
+                        last_dim=4,
+                    )
+            else:
+                ctrl_fut = getattr(self.dit.norm_dit_returns,
+                                   "control_sequence", None)
+                if isinstance(ctrl_fut, torch.Tensor):
+                    x0_after_feasible_flat = self._overwrite_x0_future_from_replacement(
+                        x0_flat=x0_guided_flat,
+                        replacement_future=ctrl_fut,  # (B,P,T,3)
+                        last_dim=3,
+                    )
+
+        # (5) 마지막에 1회 정리 + 반환
         diffusion_sequence: torch.Tensor = correcting_xt_fn(
-            x0_guided_flat.detach(),  # (B,P,F)
-            t_eff,  # (B,)
-            0,  # step
+            x0_after_feasible_flat.detach(),
+            t_eff,
+            0,
         )
         return diffusion_sequence
 
@@ -4405,6 +4670,7 @@ else
             cross_c: torch.Tensor,  # (B, token_num, D)
             cross_mask: torch.Tensor,  # (B, token_num)
             low_t_mask: Optional[torch.Tensor] = None,  # (B,) bool
+            skip_feasible: bool = False,
     ) -> torch.Tensor:
         """DiT 전체 forward 를 수행하는 진입점.
         target_input_norm_xT (input) 혹은 xT_input_flat (output)
@@ -4514,7 +4780,7 @@ else
                 (B, (1+)Pnn, T,3)
         """
         self.norm_dit_returns.diffusion_sequence = x0_4dim
-        if self.config.use_feasible:
+        if self.config.use_feasible and (not bool(skip_feasible)):
             self.do_feasible_projection(
                 x=x0,
                 low_t_mask=low_t_mask,  # (B,)

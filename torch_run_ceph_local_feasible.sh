@@ -124,7 +124,7 @@ FORCE_REBUILD=0
     --profile_feasible False \
     --use_feasible True \
     --use_feasible_dl False \
-    --use_feasible_filter False \
+    --use_feasible_filter True \
     --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
