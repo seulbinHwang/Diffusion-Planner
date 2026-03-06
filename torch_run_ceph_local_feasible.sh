@@ -113,12 +113,13 @@ FORCE_REBUILD=0
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
     --name "use_npc_data_augment_true_use_body_vel_false_feasible" \
-    --load_name "use_npc_data_augment_true_use_body_vel_false" \
+    --load_name "use_npc_data_augment_true_use_body_vel_false_feasible" \
     --resume_wandb_model_name latest \
     --resume_model_only True \
     --batch_size 1536 \
-    --train_epochs 160 \
-    --learning_rate 4e-4 \
+    --train_epochs 300 \
+    --use_lr_warmup False \
+    --learning_rate 3e-4 \
     --min_learning_rate 1e-6 \
     --pose_based False \
     --profile_feasible False \
