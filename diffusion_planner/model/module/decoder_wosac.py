@@ -1830,14 +1830,14 @@ class Decoder(nn.Module):
             if bool(getattr(self.config, "use_feasible", False)):
                 other_model_params = dict(other_model_params)
                 other_model_params["skip_feasible"] = True
-
-                dpm_solver_params[
-                    "correcting_x0_fn"] = self._build_inference_correcting_x0_fn(
-                    target_agents_past=target_agents_past,
-                    target_seq_past=target_seq_past,
-                    target_past_cur_future_valid=target_past_cur_future_valid,
-                    correcting_xt_fn=correcting_xt_fn,
-                )
+                if self.config.do_feasible_by_correcting_x0:
+                    dpm_solver_params[
+                        "correcting_x0_fn"] = self._build_inference_correcting_x0_fn(
+                        target_agents_past=target_agents_past,
+                        target_seq_past=target_seq_past,
+                        target_past_cur_future_valid=target_past_cur_future_valid,
+                        correcting_xt_fn=correcting_xt_fn,
+                    )
 
             diffusion_sequence: torch.Tensor = dpm_sampler(
                 self.dit,
