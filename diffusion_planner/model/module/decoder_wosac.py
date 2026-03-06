@@ -1408,11 +1408,6 @@ class Decoder(nn.Module):
                                 replacement_future=ctrl_fut,
                                 last_dim=3,
                             )
-
-            # -------------------------
-            # 2) 마지막에 correcting_xt_fn으로 "과거/현재 고정 + invalid=0 + yaw 단위원" 정리
-            # -------------------------
-            x0_after = correcting_xt_fn(x0_after, t_b, 0)  # (B,P,F)
             return x0_after
 
         return correcting_x0_fn
