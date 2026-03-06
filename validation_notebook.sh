@@ -191,17 +191,17 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "use_npc_data_augment_true_use_body_vel_false" \
-  --name "use_npc_data_augment_true_use_body_vel_false" \
+  --load_name "use_npc_data_augment_true_use_body_vel_false_feasible" \
+  --name "use_npc_data_augment_true_use_body_vel_false_feasible" \
   --eval_method "validation" \
   --batch_size 1 \
   --pose_based False \
   --profile_feasible False \
   --use_feasible True \
   --use_feasible_dl False \
-  --use_guidance True \
+  --use_guidance False \
   --guidance_scale 5.0 \
-  --use_feasible_filter False \
+  --use_feasible_filter True \
   --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
