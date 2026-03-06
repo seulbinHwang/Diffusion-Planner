@@ -1972,38 +1972,6 @@ class Decoder(nn.Module):
             t_tau).to(
             device=xT_f32.device, dtype=torch.float32
         )  # (B,)
-
-        # (4) (옵션) classifier guidance를 x0에 반영
-        x0_guided_flat: torch.Tensor = x0_base_flat
-        guidance_scale: float = float(
-            getattr(self.config, "guidance_scale", 0.0))
-
-        if (self._guidance_fn is not None) and (guidance_scale != 0.0):
-            # ✅ amortized 1-step에서는 x0_pred가 기본으로 안 넘어오므로,
-            #    GuidanceWrapper가 모델을 다시 호출할 때 쓸 t_tau를 전달
-            classifier_kwargs_for_guidance = dict(classifier_kwargs)
-            classifier_kwargs_for_guidance[
-                "diffusion_time_for_guidance"] = t_tau  # (B, future_len)
-            classifier_kwargs_for_guidance[
-                "low_t_mask_for_guidance"] = low_t_mask  # (B,)
-            # grad: (B,P,F) float32
-            # ✅ BUGFIX: 실제로 classifier_kwargs_for_guidance를 사용
-            grad: torch.Tensor = self._compute_guidance_grad_wrt_x(
-                x_t_flat=xT_f32,  # (B,P,F)
-                t_eff=t_eff_guidance,  # (B,)
-                classifier_kwargs=classifier_kwargs_for_guidance,
-            )
-
-            # scale: (B,1,1) float32
-            sigma2_over_alpha: torch.Tensor = self._compute_sigma2_over_alpha_for_guidance(
-                t_eff=t_eff,
-                reference_tensor_for_device=xT_f32,
-            )
-
-            # x0_guided = x0_base + guidance_scale * (sigma^2/alpha) * grad
-            x0_guided_flat = x0_base_flat + (guidance_scale *
-                                             sigma2_over_alpha) * grad
-
         # (4) guidance 반영된 x0
         x0_guided_flat: torch.Tensor = x0_base_flat
         guidance_scale: float = float(
