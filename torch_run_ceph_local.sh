@@ -84,10 +84,10 @@ TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 
 # (로컬) 학습에 사용할 경로
-#LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
-#LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
-LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v_world"
-LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v_world/diffusion_planner_training.json"
+LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
+LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
+#LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v_world"
+#LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v_world/diffusion_planner_training.json"
 
 # 복사 강제 옵션: 1이면 항상 다시 복사
 FORCE_REBUILD=0
@@ -121,21 +121,21 @@ FORCE_REBUILD=0
     --profile_feasible False \
     --use_feasible True \
     --use_feasible_dl False \
-    --use_feasible_filter False \
+    --use_feasible_filter True \
     --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
     --max_grad_norm 1.0 \
     --prefetch_factor 8 \
     --feasible_learn_noise_thresh 1.0 \
-    --p_sat 0.5 \
+    --p_sat 1.0 \
     --w_dir 1.0 \
     --w_int_min 0.05 \
     --w_int_max 2.0 \
-    --w_const 0.0 \
+    --w_const 0.5 \
     --save_utd 10 \
     --yaw_rate_loss_weight 2. \
     --integration_yaw_weight 2. \
     --use_amortized_diffusion False \
-    --use_body_vel False \
+    --use_body_vel True \
     --use_npc_data_augment True
