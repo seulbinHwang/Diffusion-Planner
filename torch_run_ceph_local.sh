@@ -128,7 +128,7 @@ FORCE_REBUILD=0
     --max_grad_norm 1.0 \
     --prefetch_factor 8 \
     --feasible_learn_noise_thresh 1.0 \
-    --p_sat 1.0 \
+    --p_sat 0.75 \
     --w_dir 1.0 \
     --w_int_min 0.05 \
     --w_int_max 2.0 \
